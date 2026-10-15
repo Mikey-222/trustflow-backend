@@ -4,10 +4,10 @@ import { readFileSync } from 'fs';
 import { ConnectionOptions } from 'tls';
 import { Pool, PoolConfig } from 'pg';
 import { DatabaseService } from './database.service';
-import { PG_POOL } from './database.constants';
+import { PG_POOL, PG_READ_POOLS } from './database.constants';
 import { config } from '../../config/env.config';
 
-export { PG_POOL } from './database.constants';
+export { PG_POOL, PG_READ_POOLS } from './database.constants';
 
 const DEFAULT_POOL_MAX = 10;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
@@ -146,11 +146,51 @@ export function buildPoolConfig(env?: NodeJS.ProcessEnv): PoolConfig | null {
 }
 
 /**
+ * Parses the comma-separated `DATABASE_READ_REPLICAS` env var and returns one
+ * PoolConfig per replica URL. Returns an empty array when the env var is unset.
+ *
+ * Each replica inherits the same SSL and pool-sizing settings as the primary so
+ * operators only need to supply the connection strings.
+ */
+export function buildReplicaPoolConfigs(): PoolConfig[] {
+  const raw = config.DATABASE_READ_REPLICAS;
+  if (!raw || !raw.trim()) return [];
+
+  const sslEnv: NodeJS.ProcessEnv = {
+    NODE_ENV: config.NODE_ENV,
+    DB_SSL: config.DB_SSL ?? 'false',
+    DB_SSL_CA: config.DB_SSL_CA,
+    DB_SSL_CERT: config.DB_SSL_CERT,
+    DB_SSL_KEY: config.DB_SSL_KEY,
+    DB_SSL_REJECT_UNAUTHORIZED: config.DB_SSL_REJECT_UNAUTHORIZED,
+  };
+
+  return raw
+    .split(',')
+    .map(url => url.trim())
+    .filter(Boolean)
+    .map(connectionString => ({
+      connectionString,
+      max: config.DB_POOL_MAX ?? DEFAULT_POOL_MAX,
+      idleTimeoutMillis: config.DB_POOL_IDLE_TIMEOUT_MS ?? DEFAULT_IDLE_TIMEOUT_MS,
+      connectionTimeoutMillis:
+        config.DB_POOL_CONNECTION_TIMEOUT_MS ?? DEFAULT_CONNECTION_TIMEOUT_MS,
+      ssl: buildSslConfig(sslEnv),
+    }));
+}
+
+/**
  * Connection pool for the Core DB (PostgreSQL). Configured via `DATABASE_URL`, or
  * discrete `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD` env vars — see
  * `.env.example`. When neither is set (the default in dev/test), `PG_POOL` resolves
  * to `null` and `DatabaseService` reports itself as unconfigured rather than throwing,
  * so the app still boots without a local Postgres.
+ *
+ * Read replicas: set `DATABASE_READ_REPLICAS` to a comma-separated list of PostgreSQL
+ * connection strings. `DatabaseService.queryRead()` distributes read-only queries
+ * across the replica pools in round-robin order, falling back to the primary pool
+ * when no replicas are configured or all replicas fail to connect.
+ * All mutating queries always execute on the primary (`PG_POOL`).
  */
 @Global()
 @Module({
@@ -158,8 +198,8 @@ export function buildPoolConfig(env?: NodeJS.ProcessEnv): PoolConfig | null {
     {
       provide: PG_POOL,
       useFactory: async () => {
-        const config = buildPoolConfig();
-        if (!config) return null;
+        const poolConfig = buildPoolConfig();
+        if (!poolConfig) return null;
 
         const logger = new SanitizedLogger('DatabaseModule');
         const maxRetries = positiveIntOr(process.env.DB_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS);
@@ -170,8 +210,7 @@ export function buildPoolConfig(env?: NodeJS.ProcessEnv): PoolConfig | null {
 
         const pool = await retryWithExponentialBackoff(
           async () => {
-            const newPool = new Pool(config);
-            // Test the connection to ensure it works
+            const newPool = new Pool(poolConfig);
             const client = await newPool.connect();
             client.release();
             return newPool;
@@ -191,8 +230,45 @@ export function buildPoolConfig(env?: NodeJS.ProcessEnv): PoolConfig | null {
         return pool;
       },
     },
+    {
+      provide: PG_READ_POOLS,
+      useFactory: async (): Promise<Pool[] | null> => {
+        const replicaConfigs = buildReplicaPoolConfigs();
+        if (replicaConfigs.length === 0) return null;
+
+        const logger = new SanitizedLogger('DatabaseModule[replicas]');
+        const pools: Pool[] = [];
+
+        for (let i = 0; i < replicaConfigs.length; i++) {
+          try {
+            const pool = new Pool(replicaConfigs[i]);
+            // Verify connectivity before accepting traffic
+            const client = await pool.connect();
+            client.release();
+            pool.on('error', error => {
+              logger.error(`Unexpected error on idle read-replica[${i}] client`, error.stack);
+            });
+            pools.push(pool);
+            logger.log(`✓ Read-replica[${i}] connection established`);
+          } catch (err) {
+            logger.warn(
+              `Read-replica[${i}] connection failed — skipping: ${(err as Error).message}`,
+            );
+          }
+        }
+
+        if (pools.length === 0) {
+          logger.warn(
+            'All configured read replicas failed to connect — reads will fall back to primary',
+          );
+          return null;
+        }
+
+        return pools;
+      },
+    },
     DatabaseService,
   ],
-  exports: [PG_POOL, DatabaseService],
+  exports: [PG_POOL, PG_READ_POOLS, DatabaseService],
 })
 export class DatabaseModule {}

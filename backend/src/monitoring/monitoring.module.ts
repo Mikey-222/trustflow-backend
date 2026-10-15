@@ -7,6 +7,7 @@ import { RequestTimeoutInterceptor } from '../common/http/request-timeout.interc
 import { DatabaseModule } from '../common/database/database.module';
 import { SorobanMetricsService } from './soroban-metrics.service';
 import { SorobanRpcMetricsInterceptor } from './soroban-rpc-metrics.interceptor';
+import { TracingService } from './tracing.service';
 
 @Global()
 @Module({
@@ -19,6 +20,7 @@ import { SorobanRpcMetricsInterceptor } from './soroban-rpc-metrics.interceptor'
     RequestTimeoutInterceptor,
     SorobanMetricsService,
     SorobanRpcMetricsInterceptor,
+    TracingService,
   ],
   exports: [
     HealthService,
@@ -27,6 +29,7 @@ import { SorobanRpcMetricsInterceptor } from './soroban-rpc-metrics.interceptor'
     RequestTimeoutInterceptor,
     SorobanMetricsService,
     SorobanRpcMetricsInterceptor,
+    TracingService,
   ],
 })
 export class MonitoringModule {}

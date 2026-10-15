@@ -1,4 +1,5 @@
 import './config/load-dotenv.bootstrap';
+import { initTracing } from './monitoring/tracing';
 import { NestFactory } from '@nestjs/core';
 import * as Sentry from '@sentry/node';
 import { AppModule } from './app.module';
@@ -24,6 +25,9 @@ try {
   process.exit(1);
 }
 
+// Initialize OpenTelemetry tracing early so all subsequent operations are traced
+initTracing();
+
 // Capture unhandled promise rejections before the app is ready
 process.on('unhandledRejection', (reason: unknown) => {
   Sentry.captureException(reason);
@@ -42,6 +46,10 @@ process.on('uncaughtException', (error: Error) => {
 });
 
 async function bootstrap() {
+  // Start OTel before creating the Nest app so auto-instrumentation patches
+  // HTTP / pg / ioredis before any of those modules are required.
+  const otelSdk = initTracing();
+
   const app = await NestFactory.create(AppModule);
 
   // The whole HTTP-level stack — security headers, body limits, Sentry, the exception
@@ -66,6 +74,12 @@ async function bootstrap() {
   // SIGINT handlers: it flips readiness to failing, drains in-flight requests within
   // SHUTDOWN_TIMEOUT_MS, runs Nest's lifecycle hooks (ending the PostgreSQL pool), then exits.
   app.get(ShutdownService).registerApp(app);
+
+  // Shut down the OTel SDK after the HTTP server has drained so all in-flight
+  // spans are flushed before the process exits.
+  if (otelSdk) {
+    process.once('beforeExit', () => otelSdk.shutdown());
+  }
 
   logger.log(`🚀 TrustFlow API running on: http://localhost:${port}`);
   if (swaggerEnabled) {

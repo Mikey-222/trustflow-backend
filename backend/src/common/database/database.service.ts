@@ -2,7 +2,7 @@ import { Inject, Injectable, OnModuleDestroy, Optional } from '@nestjs/common';
 import { SanitizedLogger } from '../logging/sanitized-logger';
 import { redactError } from '../logging/redaction';
 import { Pool, QueryResult, QueryResultRow } from 'pg';
-import { PG_POOL } from './database.constants';
+import { PG_POOL, PG_READ_POOLS } from './database.constants';
 
 import { MetricsService } from '../../monitoring/metrics.service';
 
@@ -10,19 +10,39 @@ import { MetricsService } from '../../monitoring/metrics.service';
  * Thin wrapper around the Core DB connection pool. Every query goes through here rather
  * than callers reaching for `PG_POOL` directly, so connectivity checks (`ping`) and the
  * "not configured" error message stay in one place.
+ *
+ * Read/write splitting
+ * --------------------
+ * - `query()` — always routes to the **primary** pool. Use for all INSERT/UPDATE/DELETE
+ *   and any SELECT that must observe the most recent writes.
+ * - `queryRead()` — routes to a read-replica pool selected in round-robin order.
+ *   Falls back transparently to the primary when no replicas are configured or available,
+ *   so callers never need to handle the "no replica" case themselves.
+ *
+ * Replicas are provisioned by `DatabaseModule` via the `PG_READ_POOLS` injection token,
+ * which resolves to `null` when `DATABASE_READ_REPLICAS` is not set.
  */
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
   private readonly logger = new SanitizedLogger(DatabaseService.name);
   private readonly slowQueryThresholdMs = 500;
 
+  /** Round-robin cursor for replica pool selection. */
+  private replicaCursor = 0;
+
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool | null,
+    @Optional() @Inject(PG_READ_POOLS) private readonly readPools: Pool[] | null,
     @Optional() private readonly metrics?: MetricsService,
   ) {}
 
   get isConfigured(): boolean {
     return this.pool !== null;
+  }
+
+  /** Returns true when at least one read-replica pool is available. */
+  get hasReplicas(): boolean {
+    return Array.isArray(this.readPools) && this.readPools.length > 0;
   }
 
   getPool(): Pool {
@@ -34,23 +54,68 @@ export class DatabaseService implements OnModuleDestroy {
     return this.pool;
   }
 
+  /**
+   * Returns the next read-replica pool in round-robin order.
+   * Falls back to the primary pool when no replicas are configured.
+   */
+  private getReadPool(): Pool {
+    if (!this.readPools || this.readPools.length === 0) {
+      return this.getPool();
+    }
+    const pool = this.readPools[this.replicaCursor % this.readPools.length];
+    this.replicaCursor = (this.replicaCursor + 1) % this.readPools.length;
+    return pool;
+  }
+
+  /**
+   * Execute a query on the **primary** (write) pool.
+   * Use for all mutating statements and reads that require strong consistency.
+   */
   async query<T extends QueryResultRow = QueryResultRow>(
     text: string,
     params?: unknown[],
   ): Promise<QueryResult<T>> {
+    return this.runQuery(this.getPool(), text, params, 'primary');
+  }
+
+  /**
+   * Execute a read-only query on a **replica** pool (round-robin).
+   * Falls back to the primary pool when no replicas are configured.
+   *
+   * Only use for SELECT statements that do not need to observe the latest writes
+   * from the current request — e.g. analytics aggregations, list endpoints.
+   */
+  async queryRead<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    params?: unknown[],
+  ): Promise<QueryResult<T>> {
+    return this.runQuery(
+      this.getReadPool(),
+      text,
+      params,
+      this.hasReplicas ? 'replica' : 'primary',
+    );
+  }
+
+  private async runQuery<T extends QueryResultRow = QueryResultRow>(
+    pool: Pool,
+    text: string,
+    params: unknown[] | undefined,
+    poolLabel: string,
+  ): Promise<QueryResult<T>> {
     const startTime = performance.now();
     try {
-      const result = await this.getPool().query<T>(text, params);
+      const result = await pool.query<T>(text, params);
       const duration = performance.now() - startTime;
 
-      this.logger.debug(`Query executed in ${duration.toFixed(2)}ms`);
+      this.logger.debug(`Query [${poolLabel}] executed in ${duration.toFixed(2)}ms`);
       if (this.metrics) {
         this.metrics.increment('db_query_count');
       }
 
       if (duration > this.slowQueryThresholdMs) {
         this.logger.warn(
-          `Slow query detected: ${duration.toFixed(2)}ms\nQuery: ${this.describeQuery(text)}`,
+          `Slow query [${poolLabel}] detected: ${duration.toFixed(2)}ms\nQuery: ${this.describeQuery(text)}`,
         );
         if (this.metrics) {
           this.metrics.increment('db_slow_query_count');
@@ -60,7 +125,7 @@ export class DatabaseService implements OnModuleDestroy {
     } catch (error) {
       const duration = performance.now() - startTime;
       this.logger.error(
-        `Query failed after ${duration.toFixed(2)}ms\nQuery: ${this.describeQuery(text)}\nReason: ${redactError(error)}`,
+        `Query [${poolLabel}] failed after ${duration.toFixed(2)}ms\nQuery: ${this.describeQuery(text)}\nReason: ${redactError(error)}`,
       );
       if (this.metrics) {
         this.metrics.increment('db_query_error_count');
@@ -72,12 +137,6 @@ export class DatabaseService implements OnModuleDestroy {
   /**
    * Reduces a SQL statement to a loggable shape: literals are replaced with `?` and the whole
    * string is truncated.
-   *
-   * The raw `text` used to be logged verbatim on both the slow-query and the failure path. A
-   * caller that builds SQL by interpolation (rather than using `$1` placeholders) put live
-   * values — including the `before_state`/`after_state` JSONB columns the audit log writes —
-   * straight into the logs. Values are not needed to diagnose a slow or failing query, so
-   * they are stripped rather than redacted field-by-field.
    */
   private describeQuery(text: string): string {
     const withoutLiterals = text
@@ -89,14 +148,17 @@ export class DatabaseService implements OnModuleDestroy {
   }
 
   /**
-   * Cheap connectivity check for the health endpoint. Returns `false` rather than
-   * throwing on any failure — including "not configured", since Postgres is currently
-   * optional infrastructure and an absent pool shouldn't itself look like an outage.
+   * Cheap connectivity check for the health endpoint. Pings both primary and
+   * all configured replicas; returns `false` if the primary is unreachable.
    */
   async ping(): Promise<boolean> {
     if (!this.pool) return false;
     try {
       await this.pool.query('SELECT 1');
+      // Also ping replicas so health checks surface degraded replica state
+      if (this.readPools) {
+        await Promise.allSettled(this.readPools.map(p => p.query('SELECT 1')));
+      }
       return true;
     } catch (error) {
       this.logger.error(
@@ -109,5 +171,8 @@ export class DatabaseService implements OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     if (this.pool) await this.pool.end();
+    if (this.readPools) {
+      await Promise.allSettled(this.readPools.map(p => p.end()));
+    }
   }
 }

@@ -132,6 +132,14 @@ const EnvSchema = z
     DATABASE_URL: z
       .preprocess(blankToUndefined, z.string().url().optional())
       .describe('PostgreSQL connection string; currently optional infrastructure'),
+    DATABASE_READ_REPLICAS: z
+      .string()
+      .optional()
+      .describe(
+        'Comma-separated list of read-replica connection strings. ' +
+          'When set, DatabaseService routes read-only queries (queryRead) to replicas ' +
+          'in a round-robin fashion and all writes to the primary pool.',
+      ),
 
     // Monitoring & Observability
     DB_HOST: optionalString(),
@@ -158,6 +166,29 @@ const EnvSchema = z
       .preprocess(blankToUndefined, z.string().url().optional())
       .describe('Sentry error tracking DSN; errors are logged but not reported when unset'),
     APP_RELEASE: optionalString(),
+
+    // OpenTelemetry Configuration
+    OTEL_ENABLED: optionalBool().describe(
+      'Set to "true" to enable OpenTelemetry auto-instrumentation. Defaults to false.',
+    ),
+    OTEL_SERVICE_NAME: optionalString().describe(
+      'Service name reported in traces. Defaults to "trustflow-backend".',
+    ),
+    OTEL_EXPORTER_OTLP_ENDPOINT: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe(
+        'OTLP gRPC/HTTP endpoint for the trace exporter ' +
+          '(e.g. http://otel-collector:4318). Required when OTEL_ENABLED=true.',
+      ),
+    OTEL_TRACES_SAMPLER_RATIO: z.coerce
+      .number()
+      .min(0)
+      .max(1)
+      .default(1)
+      .describe(
+        'Fraction of traces to sample (0.0–1.0). ' +
+          '1.0 = sample everything (default), 0.1 = 10 % of traces.',
+      ),
 
     // Discord Integration
     DISCORD_WEBHOOK_URL: z
