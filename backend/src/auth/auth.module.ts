@@ -6,7 +6,7 @@ import { AuthController } from './auth.controller';
 import { JwtStrategy } from './jwt.strategy';
 import { NonceStoreService } from './nonce-store.service';
 import { RefreshTokenStoreService } from './refresh-token-store.service';
-import { config } from '../config/env.config';
+import { config, JWT_ALGORITHM } from '../config/env.config';
 
 @Module({
   imports: [
@@ -18,7 +18,7 @@ import { config } from '../config/env.config';
     JwtModule.registerAsync({
       useFactory: () => ({
         secret: config.JWT_SECRET,
-        signOptions: { expiresIn: '1h' },
+        signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '24h' },
       }),
     }),
   ],

@@ -1,16 +1,17 @@
-import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { JwtService } from '@nestjs/jwt';
 import * as crypto from 'crypto';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { getJwtVerificationSecrets } from '../config/env.config';
 import { NonceStoreService } from './nonce-store.service';
-import { RefreshTokenStoreService, ACCESS_TOKEN_TTL_SECONDS } from './refresh-token-store.service';
+import { JWT_ALGORITHM } from '../config/env.config';
 
 const CHALLENGE_PREFIX = 'Sign this message to authenticate with TrustFlow: ';
 
 @Injectable()
 export class AuthService {
-  private readonly logger = new Logger(AuthService.name);
+  private readonly logger = new SanitizedLogger(AuthService.name);
 
   constructor(
     private jwtService: JwtService,
@@ -76,7 +77,10 @@ export class AuthService {
     refreshToken: string,
     address: string,
   ): Promise<{ token: string; refreshToken: string } | null> {
-    const result = await this.refreshTokenStore.validateAndRotateRefreshToken(refreshToken, address);
+    const result = await this.refreshTokenStore.validateAndRotateRefreshToken(
+      refreshToken,
+      address,
+    );
     if (!result.valid || !result.newToken) {
       return null;
     }
@@ -93,14 +97,10 @@ export class AuthService {
   }
 
   validateToken(token: string): unknown {
-    const verificationSecrets = getJwtVerificationSecrets();
-
-    for (const secret of verificationSecrets) {
-      try {
-        return this.jwtService.verify(token, { secret });
-      } catch {
-        // Fall through to the next secret so tokens signed before a rotation remain valid.
-      }
+    try {
+      return this.jwtService.verify(token, { algorithms: [JWT_ALGORITHM] });
+    } catch (error) {
+      throw new UnauthorizedException('Invalid token');
     }
 
     throw new UnauthorizedException('Invalid token');

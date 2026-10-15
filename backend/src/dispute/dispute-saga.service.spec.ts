@@ -1,16 +1,23 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { DisputeSagaService } from './dispute-saga.service';
-import { DisputeStep, DisputeVerdict } from './dispute.types';
-import { EscrowService } from '../escrow/escrow.service';
+import { DisputeSaga, DisputeStep, DisputeVerdict } from './dispute.types';
+import { Escrow, EscrowService, EscrowStatus } from '../escrow/escrow.service';
 import { WebhookService } from '../webhook/webhook.service';
+import { DiscordService } from '../webhook/discord.service';
 import { NotificationService } from '../notification/notification.service';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { MetricsService } from '../monitoring/metrics.service';
+import { EscrowChainStateClient } from '../escrow-reconciliation/escrow-chain-state.client';
 
 // ─── Shared mock factories ────────────────────────────────────────────────────
 
-function makeEscrow(overrides: Partial<any> = {}) {
+function makeEscrow(overrides: Partial<Escrow> = {}): Escrow {
   return {
     id: 'esc-001',
     depositor: 'GDEPOSITOR111111111111111111111111111111111111111111111',
@@ -27,32 +34,38 @@ function buildMocks() {
 
   const escrowService = {
     findById: jest.fn().mockResolvedValue(escrow),
-    raiseDispute: jest.fn().mockImplementation(async (_id: string, _reason: string) => {
+    findAll: jest.fn().mockResolvedValue([escrow]),
+    raiseDispute: jest.fn().mockImplementation((_id: string, reason: string) => {
       escrow.status = 'disputed';
-      return escrow;
+      escrow.disputeReason = reason;
+      escrow.disputedAt = new Date().toISOString();
+      return Promise.resolve({ ...escrow });
     }),
-    release: jest.fn().mockImplementation(async () => {
+    release: jest.fn().mockImplementation(() => {
       escrow.status = 'released';
-      return escrow;
+      return Promise.resolve(escrow);
     }),
-    cancel: jest.fn().mockImplementation(async () => {
+    cancel: jest.fn().mockImplementation(() => {
       escrow.status = 'cancelled';
-      return escrow;
+      return Promise.resolve(escrow);
     }),
-    split: jest.fn().mockImplementation(async (_id: string, splitPercentage: number) => {
+    split: jest.fn().mockImplementation((_id: string, splitPercentage: number) => {
       escrow.status = 'released';
-      (escrow as any).splitPercentage = splitPercentage;
-      return escrow;
+      escrow.splitPercentage = splitPercentage;
+      return Promise.resolve(escrow);
     }),
-    correctStatus: jest
-      .fn()
-      .mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
-        Object.assign(escrow, patch);
-        return escrow;
-      }),
+    correctStatus: jest.fn().mockImplementation((_id: string, patch: Record<string, unknown>) => {
+      Object.assign(escrow, patch);
+      return Promise.resolve(escrow);
+    }),
+    applyChainState: jest.fn().mockImplementation((_id: string, patch: Record<string, unknown>) => {
+      Object.assign(escrow, patch);
+      return Promise.resolve(escrow);
+    }),
   };
 
   const webhookService = { dispatch: jest.fn().mockResolvedValue(undefined) };
+  const discordService = { notifyDisputeNeedsJurors: jest.fn().mockResolvedValue(undefined) };
   const notificationService = {
     notifyDisputeEscalated: jest.fn().mockResolvedValue(undefined),
     notifyJurorsAssigned: jest.fn().mockResolvedValue(undefined),
@@ -65,6 +78,7 @@ function buildMocks() {
     escrowService,
     webhookService,
     notificationService,
+    discordService,
   };
 }
 
@@ -79,6 +93,12 @@ const ESCALATE_DTO = {
   reason: 'Work was not delivered as agreed in the contract',
 };
 
+/** The saga's private persistence steps, for failure injection at each boundary. */
+interface SagaPersistence {
+  createSaga(saga: DisputeSaga): Promise<void>;
+  persistSaga(saga: DisputeSaga): Promise<void>;
+}
+
 // ─── Test suite ───────────────────────────────────────────────────────────────
 
 describe('DisputeSagaService', () => {
@@ -87,6 +107,7 @@ describe('DisputeSagaService', () => {
   let webhookService: ReturnType<typeof buildMocks>['webhookService'];
   let notificationService: ReturnType<typeof buildMocks>['notificationService'];
   let escrow: ReturnType<typeof buildMocks>['escrow'];
+  let discordService: ReturnType<typeof buildMocks>['discordService'];
 
   beforeEach(async () => {
     const mocks = buildMocks();
@@ -94,6 +115,7 @@ describe('DisputeSagaService', () => {
     webhookService = mocks.webhookService;
     notificationService = mocks.notificationService;
     escrow = mocks.escrow;
+    discordService = mocks.discordService;
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -103,6 +125,7 @@ describe('DisputeSagaService', () => {
         { provide: NotificationService, useValue: notificationService },
         { provide: REDIS_CLIENT, useValue: null },
         { provide: MetricsService, useValue: { increment: jest.fn() } },
+        { provide: DiscordService, useValue: discordService },
       ],
     }).compile();
 
@@ -123,7 +146,11 @@ describe('DisputeSagaService', () => {
       expect(saga.escrowId).toBe('esc-001');
       expect(saga.currentStep).toBe(DisputeStep.JUROR_ASSIGNMENT);
       expect(saga.escalationTxHash).toBeDefined();
-      expect(escrowService.raiseDispute).toHaveBeenCalledWith('esc-001', ESCALATE_DTO.reason);
+      expect(escrowService.raiseDispute).toHaveBeenCalledWith(
+        'esc-001',
+        ESCALATE_DTO.reason,
+        ESCALATE_DTO.initiator,
+      );
     });
 
     it('allows re-escalation if the previous saga is COMPLETED', async () => {
@@ -199,6 +226,183 @@ describe('DisputeSagaService', () => {
       // No saga stored — compensation cleaned up
       const all = await service.findAll();
       expect(all.filter(s => s.currentStep !== DisputeStep.FAILED).length).toBe(0);
+    });
+  });
+
+  // ─── escalate: entry-point rules (#633) ──────────────────────────
+
+  describe('escalate() — who and what may start a dispute (#633)', () => {
+    it.each(['pending', 'cancelled', 'released'] as EscrowStatus[])(
+      'rejects a %s escrow with BadRequestException, before recording a saga',
+      async status => {
+        escrow.status = status;
+        await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow(
+          BadRequestException,
+        );
+        expect(escrowService.raiseDispute).not.toHaveBeenCalled();
+        expect(await service.findAll()).toHaveLength(0);
+      },
+    );
+
+    it('rejects an initiator who is not a party to the escrow, before recording a saga', async () => {
+      await expect(
+        service.escalate('esc-001', { ...ESCALATE_DTO, initiator: 'GSTRANGER' }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(escrowService.raiseDispute).not.toHaveBeenCalled();
+      expect(await service.findAll()).toHaveLength(0);
+    });
+
+    it('adopts an already-disputed escrow with no active saga, without re-raising it', async () => {
+      escrow.status = 'disputed';
+      const saga = await service.escalate('esc-001', ESCALATE_DTO);
+      expect(saga.currentStep).toBe(DisputeStep.JUROR_ASSIGNMENT);
+      expect(escrowService.raiseDispute).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── escalate: saga/escrow consistency (#634, #635) ──────────────
+
+  describe('escalate() — failure at each boundary (#634, #635)', () => {
+    it('saga creation fails → escrow is never frozen', async () => {
+      jest
+        .spyOn(service as unknown as SagaPersistence, 'createSaga')
+        .mockRejectedValueOnce(new Error('redis down'));
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow('redis down');
+      expect(escrowService.raiseDispute).not.toHaveBeenCalled();
+      expect(escrowService.correctStatus).not.toHaveBeenCalled();
+      expect(escrow.status).toBe('active');
+    });
+
+    it('saga is recorded before the escrow is frozen', async () => {
+      const order: string[] = [];
+      jest.spyOn(service as unknown as SagaPersistence, 'createSaga').mockImplementationOnce(() => {
+        order.push('createSaga');
+        return Promise.resolve();
+      });
+      escrowService.raiseDispute.mockImplementationOnce(() => {
+        order.push('raiseDispute');
+        escrow.status = 'disputed';
+        return Promise.resolve({ ...escrow });
+      });
+      await service.escalate('esc-001', ESCALATE_DTO);
+      expect(order).toEqual(['createSaga', 'raiseDispute']);
+    });
+
+    it('freezing fails (before this saga changed the escrow) → nothing is reverted, saga FAILED', async () => {
+      escrowService.raiseDispute.mockRejectedValueOnce(new Error('on-chain error'));
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow('on-chain error');
+      expect(escrowService.correctStatus).not.toHaveBeenCalled();
+      const [saga] = await service.findAll();
+      expect(saga.currentStep).toBe(DisputeStep.FAILED);
+    });
+
+    it('freezing fails because another path disputed it first → that dispute is left alone', async () => {
+      escrowService.raiseDispute.mockImplementationOnce(() => {
+        // Another path won the race: the escrow is disputed, but not by us.
+        escrow.status = 'disputed';
+        escrow.disputedAt = '2026-01-01T00:00:00.000Z';
+        return Promise.reject(new ConflictException('Escrow is already disputed'));
+      });
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow(ConflictException);
+      expect(escrowService.correctStatus).not.toHaveBeenCalled();
+      expect(escrow.status).toBe('disputed');
+    });
+
+    it('committing the saga fails after this saga froze the escrow → restores the recorded prior status', async () => {
+      const persist = jest.spyOn(service as unknown as SagaPersistence, 'persistSaga');
+      persist.mockRejectedValueOnce(new Error('redis write failed'));
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow('redis write failed');
+      expect(escrowService.correctStatus).toHaveBeenCalledWith('esc-001', {
+        status: 'active',
+        clearDispute: true,
+      });
+      expect(escrow.status).toBe('active');
+      const [saga] = await service.findAll();
+      expect(saga.priorEscrowStatus).toBe('active');
+      expect(saga.currentStep).toBe(DisputeStep.FAILED);
+    });
+
+    it('does not revert when the escrow changed hands between freezing and compensation', async () => {
+      const persist = jest.spyOn(service as unknown as SagaPersistence, 'persistSaga');
+      persist.mockImplementationOnce(() => {
+        // Someone else re-disputed the escrow after us (different disputedAt).
+        escrow.disputedAt = '2099-01-01T00:00:00.000Z';
+        return Promise.reject(new Error('redis write failed'));
+      });
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow();
+      expect(escrowService.correctStatus).not.toHaveBeenCalled();
+      expect(escrow.status).toBe('disputed');
+    });
+
+    it('a failed escalation never leaves the escrow disputed without an active saga', async () => {
+      for (const fail of ['createSaga', 'raiseDispute', 'persistSaga'] as const) {
+        escrow.status = 'active';
+        escrowService.correctStatus.mockClear();
+        if (fail === 'raiseDispute') {
+          escrowService.raiseDispute.mockRejectedValueOnce(new Error(fail));
+        } else {
+          jest
+            .spyOn(service as unknown as SagaPersistence, fail)
+            .mockRejectedValueOnce(new Error(fail));
+        }
+        await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow(fail);
+        const active = (await service.findAll()).filter(
+          s => s.currentStep !== DisputeStep.FAILED && s.currentStep !== DisputeStep.COMPLETED,
+        );
+        expect({ fail, status: escrow.status, active: active.length }).toEqual({
+          fail,
+          status: 'active',
+          active: 0,
+        });
+      }
+    });
+
+    it('a notification failure after commit does not undo the dispute', async () => {
+      notificationService.notifyDisputeEscalated.mockRejectedValueOnce(new Error('smtp down'));
+      webhookService.dispatch.mockRejectedValueOnce(new Error('queue full'));
+      discordService.notifyDisputeNeedsJurors.mockRejectedValueOnce(new Error('discord down'));
+      const saga = await service.escalate('esc-001', ESCALATE_DTO);
+      expect(saga.currentStep).toBe(DisputeStep.JUROR_ASSIGNMENT);
+      expect(escrowService.correctStatus).not.toHaveBeenCalled();
+      expect(escrow.status).toBe('disputed');
+    });
+  });
+
+  // ─── escalate: notifications (#636) ──────────────────────────────
+
+  describe('escalate() — notifications are sent once (#636)', () => {
+    const count = (event: string) =>
+      webhookService.dispatch.mock.calls.filter(([e]: [string]) => e === event).length;
+
+    it.each([
+      ['api', () => service.escalate('esc-001', ESCALATE_DTO)],
+      ['chain', () => service.escalateFromChain('esc-001', 'Dispute raised on-chain')],
+    ])(
+      '%s entry point: one dispute.raised, one dispute.escalated, one Discord, one in-app',
+      async (_origin, run) => {
+        const saga = await run();
+        expect(count('dispute.raised')).toBe(1);
+        expect(count('dispute.escalated')).toBe(1);
+        expect(discordService.notifyDisputeNeedsJurors).toHaveBeenCalledTimes(1);
+        expect(notificationService.notifyDisputeEscalated).toHaveBeenCalledTimes(1);
+        expect(webhookService.dispatch).toHaveBeenCalledWith('dispute.raised', {
+          escrowId: 'esc-001',
+          depositor: escrow.depositor,
+          beneficiary: escrow.beneficiary,
+          amountXLM: escrow.amountXLM,
+          reason: saga.reason,
+          disputedAt: escrow.disputedAt,
+          sagaId: saga.sagaId,
+        });
+      },
+    );
+
+    it('a failed escalation sends no dispute notifications', async () => {
+      escrowService.raiseDispute.mockRejectedValueOnce(new Error('boom'));
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow();
+      expect(count('dispute.raised')).toBe(0);
+      expect(discordService.notifyDisputeNeedsJurors).not.toHaveBeenCalled();
+      expect(notificationService.notifyDisputeEscalated).not.toHaveBeenCalled();
     });
   });
 
@@ -376,7 +580,6 @@ describe('DisputeSagaService', () => {
       );
     });
 
-
     it('throws BadRequestException when called before PAYOUT step', async () => {
       const saga = await service.escalate('esc-001', ESCALATE_DTO);
       await expect(service.executePayout(saga.sagaId, {})).rejects.toThrow(BadRequestException);
@@ -414,6 +617,145 @@ describe('DisputeSagaService', () => {
     it('returns the saga when one exists', async () => {
       const saga = await service.escalate('esc-001', ESCALATE_DTO);
       expect((await service.findByEscrowId('esc-001'))?.sagaId).toBe(saga.sagaId);
+    });
+  });
+
+  // ─── compensateEscalation: chain state sync (#647) ────────────────
+
+  describe('compensateEscalation() — re-read chain state and sync DB (#647)', () => {
+    it('re-syncs escrow from chain when DB write fails after on-chain transaction', async () => {
+      // Simulate an escrow that has a contract ID (linked to chain)
+      const chainEscrow = makeEscrow({ contractEscrowId: 'contract-123' });
+      escrowService.findById.mockResolvedValue(chainEscrow);
+
+      // Mock chain client that returns disputed state
+      const chainClient = {
+        getEscrow: jest.fn().mockResolvedValue({
+          status: 'disputed',
+          depositor: chainEscrow.depositor,
+          beneficiary: chainEscrow.beneficiary,
+          amountXLM: chainEscrow.amountXLM,
+        }),
+      };
+
+      // Mock applyChainState method
+      const applyChainState = jest.fn().mockResolvedValue(chainEscrow);
+      escrowService.applyChainState = applyChainState;
+      escrowService.findAll = jest.fn().mockResolvedValue([chainEscrow]);
+
+      // Rebuild service with chain client
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DisputeSagaService,
+          { provide: EscrowService, useValue: escrowService },
+          { provide: WebhookService, useValue: webhookService },
+          { provide: NotificationService, useValue: notificationService },
+          { provide: REDIS_CLIENT, useValue: null },
+          { provide: MetricsService, useValue: { increment: jest.fn() } },
+          { provide: DiscordService, useValue: discordService },
+          { provide: EscrowChainStateClient, useValue: chainClient },
+        ],
+      }).compile();
+
+      service = module.get<DisputeSagaService>(DisputeSagaService);
+
+      // Make the persist step fail after raiseDispute succeeds
+      jest
+        .spyOn(service as unknown as SagaPersistence, 'persistSaga')
+        .mockRejectedValueOnce(new Error('DB connection lost'));
+
+      escrowService.raiseDispute.mockResolvedValueOnce({
+        ...chainEscrow,
+        status: 'disputed',
+        disputedAt: new Date().toISOString(),
+      });
+
+      // Attempt escalation - should fail at persist step but compensate by syncing from chain
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow('DB connection lost');
+
+      // Verify chain state was queried during compensation
+      expect(chainClient.getEscrow).toHaveBeenCalledWith('contract-123');
+
+      // Verify the saga failed
+      const [saga] = await service.findAll();
+      expect(saga.currentStep).toBe(DisputeStep.FAILED);
+      expect(saga.compensationReason).toContain('DB connection lost');
+    });
+
+    it('logs warning and continues when chain client is unavailable', async () => {
+      const chainEscrow = makeEscrow({ contractEscrowId: 'contract-456' });
+      escrowService.findById.mockResolvedValue(chainEscrow);
+
+      // No chain client provided (simulates optional dependency not available)
+      const logSpy = jest.spyOn(
+        (service as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger,
+        'warn',
+      );
+
+      jest
+        .spyOn(service as unknown as SagaPersistence, 'persistSaga')
+        .mockRejectedValueOnce(new Error('DB failure'));
+
+      escrowService.raiseDispute.mockResolvedValueOnce({
+        ...chainEscrow,
+        status: 'disputed',
+        disputedAt: new Date().toISOString(),
+      });
+
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow('DB failure');
+
+      // Compensation should still complete even without chain sync capability
+      const [saga] = await service.findAll();
+      expect(saga.currentStep).toBe(DisputeStep.FAILED);
+
+      // Verify no crash occurred - service handled missing chain client gracefully
+      expect(logSpy).toHaveBeenCalled();
+    });
+
+    it('continues compensation even if chain sync itself fails', async () => {
+      const chainEscrow = makeEscrow({ contractEscrowId: 'contract-789' });
+      escrowService.findById.mockResolvedValue(chainEscrow);
+
+      const chainClient = {
+        getEscrow: jest.fn().mockRejectedValue(new Error('Chain RPC timeout')),
+      };
+
+      escrowService.findAll = jest.fn().mockResolvedValue([chainEscrow]);
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          DisputeSagaService,
+          { provide: EscrowService, useValue: escrowService },
+          { provide: WebhookService, useValue: webhookService },
+          { provide: NotificationService, useValue: notificationService },
+          { provide: REDIS_CLIENT, useValue: null },
+          { provide: MetricsService, useValue: { increment: jest.fn() } },
+          { provide: DiscordService, useValue: discordService },
+          { provide: EscrowChainStateClient, useValue: chainClient },
+        ],
+      }).compile();
+
+      service = module.get<DisputeSagaService>(DisputeSagaService);
+
+      jest
+        .spyOn(service as unknown as SagaPersistence, 'persistSaga')
+        .mockRejectedValueOnce(new Error('DB failure'));
+
+      escrowService.raiseDispute.mockResolvedValueOnce({
+        ...chainEscrow,
+        status: 'disputed',
+        disputedAt: new Date().toISOString(),
+      });
+
+      await expect(service.escalate('esc-001', ESCALATE_DTO)).rejects.toThrow('DB failure');
+
+      // Compensation should mark saga as failed even if chain sync errored
+      const [saga] = await service.findAll();
+      expect(saga.currentStep).toBe(DisputeStep.FAILED);
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'dispute.saga_failed',
+        expect.objectContaining({ reason: 'DB failure' }),
+      );
     });
   });
 });

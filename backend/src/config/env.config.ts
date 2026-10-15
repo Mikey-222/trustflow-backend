@@ -17,6 +17,8 @@ import { z } from 'zod';
 const blankToUndefined = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? undefined : v);
 const optionalPositiveInt = () =>
   z.preprocess(blankToUndefined, z.coerce.number().int().positive().optional());
+const optionalNonnegativeInt = () =>
+  z.preprocess(blankToUndefined, z.coerce.number().int().nonnegative().optional());
 const optionalString = () => z.preprocess(blankToUndefined, z.string().optional());
 const optionalBool = () => z.preprocess(blankToUndefined, z.enum(['true', 'false']).optional());
 
@@ -35,13 +37,20 @@ const EnvSchema = z
     // Server configuration
     PORT: z.coerce.number().int().positive().default(3001),
     CORS_ORIGIN: z.preprocess(
-      (val) => {
+      val => {
         if (typeof val !== 'string') return undefined;
         if (!val.trim()) return undefined;
-        const origins = Array.from(new Set(val.split(',').map(s => s.trim()).filter(Boolean)));
+        const origins = Array.from(
+          new Set(
+            val
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean),
+          ),
+        );
         return origins.length > 0 ? origins : undefined;
       },
-      z.array(z.string().url().or(z.literal('*'))).optional()
+      z.array(z.string().url().or(z.literal('*'))).optional(),
     ),
     API_URL: z.string().url().optional().default('http://localhost:3001'),
     BODY_LIMIT_MB: z.coerce.number().int().positive().default(15),
@@ -148,6 +157,7 @@ const EnvSchema = z
     SENTRY_DSN: z
       .preprocess(blankToUndefined, z.string().url().optional())
       .describe('Sentry error tracking DSN; errors are logged but not reported when unset'),
+    APP_RELEASE: optionalString(),
 
     // Discord Integration
     DISCORD_WEBHOOK_URL: z
@@ -182,25 +192,36 @@ const EnvSchema = z
 
     // Event Processing Configuration
     EVENT_PROCESSING_CONCURRENCY: z.coerce.number().int().positive().default(8),
-
-    // IPFS Pinning Configuration
-    IPFS_PINATA_JWT: z.string().optional().describe('Pinata API JWT token'),
-    IPFS_WEB3_STORAGE_TOKEN: z.string().optional().describe('Web3.Storage API token'),
-    IPFS_INFURA_PROJECT_ID: z.string().optional().describe('Infura IPFS project ID'),
-    IPFS_INFURA_PROJECT_SECRET: z.string().optional().describe('Infura IPFS project secret'),
-    IPFS_PROVIDER_TIMEOUT_MS: z.coerce
+    ESCROW_RECONCILIATION_SWEEP_CONCURRENCY: optionalPositiveInt(),
+    ESCROW_RECONCILIATION_SWEEP_INTERVAL_MS: optionalNonnegativeInt(),
+    RUN_MIGRATIONS_ON_STARTUP: optionalBool(),
+    WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+    WEBHOOK_RELAY_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+    WEBHOOK_RELAY_LEASE_MS: z.coerce.number().int().positive().default(30_000),
+    OUTBOX_RELAY_INTERVAL_MS: z.coerce.number().int().nonnegative().default(1000),
+    OUTBOX_RELAY_BATCH_SIZE: z.coerce.number().int().positive().default(100),
+    OUTBOX_RELAY_LEASE_MS: z.coerce.number().int().positive().default(30_000),
+    OUTBOX_DELIVERED_TTL_SECONDS: z.coerce
       .number()
       .int()
       .positive()
-      .default(30000)
-      .describe('Timeout for IPFS provider HTTP requests in milliseconds. Default 30s.'),
-    IPFS_REPIN_INTERVAL_MS: z.coerce
+      .default(7 * 24 * 60 * 60),
+    OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+    OUTBOX_QUEUE_MAX_LENGTH: z.coerce.number().int().positive().default(1000),
+    IDEMPOTENCY_KEY_TTL_SECONDS: z.coerce
       .number()
       .int()
-      .optional()
-      .describe('Interval between IPFS repin sweeps in milliseconds'),
-    IPFS_REPIN_SWEEP_CONCURRENCY: optionalPositiveInt()
-      .describe('Max concurrent CID reconciliations per IPFS repin sweep. Default 8.'),
+      .positive()
+      .default(24 * 60 * 60),
+    GIG_SEARCH_CACHE_TTL_SECONDS: optionalPositiveInt(),
+
+    // IPFS Pinning Configuration
+    PINATA_JWT: z.string().optional().describe('Pinata API JWT token'),
+    WEB3_STORAGE_TOKEN: z.string().optional().describe('Web3.Storage API token'),
+    INFURA_IPFS_PROJECT_ID: z.string().optional().describe('Infura IPFS project ID'),
+    INFURA_IPFS_PROJECT_SECRET: z.string().optional().describe('Infura IPFS project secret'),
+    IPFS_REPIN_SWEEP_CONCURRENCY: z.coerce.number().int().positive().default(8),
+    IPFS_REPIN_INTERVAL_MS: optionalNonnegativeInt(),
 
     // Reputation System Configuration
     REPUTATION_DECAY_HALF_LIFE_MS: z.coerce.number().int().positive().optional(),
@@ -211,7 +232,22 @@ const EnvSchema = z
       .int()
       .positive()
       .default(30000)
-      .describe('Global inbound request timeout in milliseconds (408 Request Timeout returned on timeout). Default 30s.'),
+      .describe(
+        'Global inbound request timeout in milliseconds (408 Request Timeout returned on timeout). Default 30s.',
+      ),
+
+    // Graceful Shutdown Configuration
+    SHUTDOWN_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(30_000)
+      .describe(
+        'How long to wait for in-flight requests to complete after SIGTERM before forcing exit',
+      ),
+    SHUTDOWN_FORCE_EXIT: optionalBool().describe(
+      'Set to false to skip the process.exit() after a clean shutdown (e.g. under a test runner that owns the event loop)',
+    ),
 
     // Gig Expiry Worker Configuration
     GIG_EXPIRY_SWEEP_INTERVAL_MS: z.coerce
@@ -219,10 +255,12 @@ const EnvSchema = z
       .int()
       .optional()
       .describe('Gig expiry sweep interval in milliseconds. 0 or negative disables the sweep.'),
-    GIG_EXPIRY_SWEEP_CONCURRENCY: optionalPositiveInt()
-      .describe('Max concurrent gig expirations per sweep. Default 8.'),
-    GIG_EXPIRY_SWEEP_MAX_GIGS: optionalPositiveInt()
-      .describe('Cap on gigs to expire per sweep; continuing on next tick if more remain. Prevents monopolising a tick. Default unlimited.'),
+    GIG_EXPIRY_SWEEP_CONCURRENCY: optionalPositiveInt().describe(
+      'Max concurrent gig expirations per sweep. Default 8.',
+    ),
+    GIG_EXPIRY_SWEEP_MAX_GIGS: optionalPositiveInt().describe(
+      'Cap on gigs to expire per sweep; continuing on next tick if more remain. Prevents monopolising a tick. Default unlimited.',
+    ),
   })
   .superRefine((data, ctx) => {
     const issue = (path: string, message: string) =>
@@ -252,7 +290,11 @@ const EnvSchema = z
       issue('SWAGGER_USER', 'protect production Swagger with SWAGGER_USER and SWAGGER_PASSWORD');
     }
 
-    if (isProduction && (!data.REDIS_URL || data.REDIS_URL.trim() === '') && data.ALLOW_NO_REDIS !== 'true') {
+    if (
+      isProduction &&
+      (!data.REDIS_URL || data.REDIS_URL.trim() === '') &&
+      data.ALLOW_NO_REDIS !== 'true'
+    ) {
       issue(
         'REDIS_URL',
         'REDIS_URL is required in production unless ALLOW_NO_REDIS=true is set for a deliberate single-node opt-out',
@@ -323,6 +365,7 @@ export type EnvConfig = z.infer<typeof EnvSchema>;
  */
 export const TEST_ONLY_JWT_SECRET =
   'test-only-jwt-secret-for-development-and-test-do-not-use-in-production';
+export const JWT_ALGORITHM = 'HS256' as const;
 
 let validatedConfig: EnvConfig | null = null;
 
@@ -341,7 +384,7 @@ export function validateEnv(): EnvConfig {
   }
 
   try {
-    const parsed = EnvSchema.parse(process.env) as EnvConfig;
+    const parsed = EnvSchema.parse(process.env);
     // Inject clearly-marked test-only fallback for non-production when no secret is provided
     if (!parsed.JWT_SECRET || parsed.JWT_SECRET.trim() === '') {
       if (parsed.NODE_ENV !== 'production') {

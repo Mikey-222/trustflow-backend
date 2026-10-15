@@ -3,14 +3,18 @@ import {
   ConflictException,
   Inject,
   Injectable,
-  Logger,
   NotFoundException,
   OnModuleInit,
   Optional,
 } from '@nestjs/common';
+import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { createHash } from 'crypto';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
+import {
+  assertTransactionApplied,
+  isTransactionIntegrityError,
+} from '../common/redis/redis-transaction';
 import { MetricsService } from '../monitoring/metrics.service';
 import { CreateGigDto, SearchGigsQuery, UpdateGigDto } from './gig.dto';
 import {
@@ -24,7 +28,7 @@ import {
   PaginatedGigs,
 } from './gig.entity';
 import { OutboxService } from '../outbox/outbox.service';
-import { amountGreaterThanOrEqual, amountLessThanOrEqual } from '../common/amount';
+import { config } from '../config/env.config';
 
 const GIG_KEY_PREFIX = 'gig:';
 const GIGS_INDEX_KEY = 'gigs:index';
@@ -48,7 +52,7 @@ export const GIG_PERSISTENCE_FALLBACK_METRIC = 'gig_persistence_fallback_total';
  */
 @Injectable()
 export class GigService implements OnModuleInit {
-  private readonly logger = new Logger(GigService.name);
+  private readonly logger = new SanitizedLogger(GigService.name);
 
   /** Fallback store, only used while Redis is unavailable. */
   private readonly gigs = new Map<string, Gig>();
@@ -66,7 +70,7 @@ export class GigService implements OnModuleInit {
    * in-memory fallback so the app still runs without a local Redis.
    */
   onModuleInit(): void {
-    if (!this.redis && process.env.NODE_ENV === 'production') {
+    if (!this.redis && config.NODE_ENV === 'production') {
       throw new Error(
         'GigService requires REDIS_URL to be configured in production — refusing to start ' +
           'with per-instance in-memory storage, which would silently diverge across instances.',
@@ -102,7 +106,7 @@ export class GigService implements OnModuleInit {
           .sadd(this.creatorKey(gig.creator), id);
         if (event) this.outbox!.appendToTransaction(transaction, event);
         const results = await transaction.exec();
-        this.assertTransactionOk(results);
+        assertTransactionApplied(results);
         await this.invalidateSearchCache();
         return gig;
       } catch (err) {
@@ -290,8 +294,7 @@ export class GigService implements OnModuleInit {
           }
         }
         if (
-          err.message?.includes('transaction aborted') ||
-          err.message?.includes('transaction command failed') ||
+          isTransactionIntegrityError(err) ||
           err.message?.includes('In-memory transaction aborted')
         ) {
           lastError = err;
@@ -362,14 +365,11 @@ export class GigService implements OnModuleInit {
             .zrem(GIGS_OPEN_BY_RESPOND_BY_KEY, id)
             .srem(this.creatorKey(gig.creator), id);
           const results = await transaction.exec();
-          this.assertTransactionOk(results);
+          assertTransactionApplied(results);
           await this.invalidateSearchCache();
           return;
         } catch (err: any) {
-          if (
-            err.message?.includes('transaction aborted') ||
-            err.message?.includes('transaction command failed')
-          ) {
+          if (isTransactionIntegrityError(err)) {
             throw err;
           }
           this.logFallback('remove', err);
@@ -406,14 +406,11 @@ export class GigService implements OnModuleInit {
           .zrem(GIGS_OPEN_BY_RESPOND_BY_KEY, gig.id);
         if (event) this.outbox!.appendToTransaction(transaction, event);
         const results = await transaction.exec();
-        this.assertTransactionOk(results);
+        assertTransactionApplied(results);
         await this.invalidateSearchCache();
         return;
       } catch (err: any) {
-        if (
-          err.message?.includes('transaction aborted') ||
-          err.message?.includes('transaction command failed')
-        ) {
+        if (isTransactionIntegrityError(err)) {
           throw err;
         }
         this.logFallback('persistResolved', err);
@@ -439,14 +436,11 @@ export class GigService implements OnModuleInit {
           .set(this.gigKey(gig.id), JSON.stringify(gig))
           .zadd(GIGS_OPEN_BY_RESPOND_BY_KEY, new Date(gig.respondBy).getTime(), gig.id)
           .exec();
-        this.assertTransactionOk(results);
+        assertTransactionApplied(results);
         await this.invalidateSearchCache();
         return;
       } catch (err: any) {
-        if (
-          err.message?.includes('transaction aborted') ||
-          err.message?.includes('transaction command failed')
-        ) {
+        if (isTransactionIntegrityError(err)) {
           throw err;
         }
         this.logFallback('persistGig', err);
@@ -473,23 +467,6 @@ export class GigService implements OnModuleInit {
     if (ids.length === 0) return [];
     const raw = await this.redis!.mget(...ids.map(id => this.gigKey(id)));
     return raw.filter((r): r is string => r !== null).map(r => JSON.parse(r) as Gig);
-  }
-
-  /**
-   * `MULTI`/`EXEC` only rejects the whole batch on a queue-time error (e.g. a malformed
-   * command); a runtime failure in one queued command instead surfaces as a per-command
-   * `[Error, null]` entry in the results array while `exec()` itself still resolves. Without
-   * this check a partially-applied transaction (e.g. the entity written but an index update
-   * silently dropped) would be treated as a full success.
-   */
-  private assertTransactionOk(results: Array<[Error | null, unknown]> | null): void {
-    if (!results) {
-      throw new Error('Redis transaction aborted (exec() returned null, e.g. a WATCH conflict)');
-    }
-    const failed = results.find(([err]) => err);
-    if (failed) {
-      throw new Error(`Redis transaction command failed: ${failed[0]!.message}`);
-    }
   }
 
   private gigKey(id: string): string {
@@ -525,8 +502,7 @@ export class GigService implements OnModuleInit {
   }
 
   private getSearchCacheTtlSeconds(): number {
-    const raw = Number(process.env.GIG_SEARCH_CACHE_TTL_SECONDS);
-    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_GIG_SEARCH_CACHE_TTL_SECONDS;
+    return config.GIG_SEARCH_CACHE_TTL_SECONDS ?? DEFAULT_GIG_SEARCH_CACHE_TTL_SECONDS;
   }
 
   private async readSearchCache(key: string): Promise<PaginatedGigs | undefined> {

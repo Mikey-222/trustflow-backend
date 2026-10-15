@@ -1,12 +1,12 @@
 import {
   Inject,
   Injectable,
-  Logger,
   NotFoundException,
   ConflictException,
   OnModuleInit,
   Optional,
 } from '@nestjs/common';
+import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import BigNumber from 'bignumber.js';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
@@ -14,7 +14,7 @@ import { MetricsService } from '../monitoring/metrics.service';
 import { UserType, UserStatus } from './user-profile.entity';
 import { CreateUserProfileDto, UpdateUserProfileDto, RateUserDto } from './user-profile.dto';
 import { randomUUID } from 'crypto';
-import { parseAmount, normalizeAmount } from '../common/amount';
+import { config } from '../config/env.config';
 
 export interface UserProfile {
   id: string;
@@ -65,7 +65,7 @@ export const USER_PROFILE_PERSISTENCE_FALLBACK_METRIC = 'user_profile_persistenc
  */
 @Injectable()
 export class UserProfileService implements OnModuleInit {
-  private readonly logger = new Logger(UserProfileService.name);
+  private readonly logger = new SanitizedLogger(UserProfileService.name);
 
   /** Fallback stores, only used while Redis is unavailable. */
   private profiles: Map<string, UserProfile> = new Map();
@@ -77,7 +77,7 @@ export class UserProfileService implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    if (!this.redis && process.env.NODE_ENV === 'production') {
+    if (!this.redis && config.NODE_ENV === 'production') {
       throw new Error(
         'UserProfileService requires REDIS_URL to be configured in production — refusing to ' +
           'start with per-instance in-memory storage, which would silently diverge across instances.',

@@ -31,21 +31,25 @@ export class IsStellarAddressValidator implements ValidatorConstraintInterface {
 }
 
 export class EscalateDisputeDto {
-  @ApiProperty({
-    description: 'Stellar address of the initiating party (ignored; derived from JWT)',
-    example: 'GXXX...',
+  /**
+   * Set by the server from the authenticated wallet (#633) — never read from
+   * the request. Still accepted in the body so existing clients that send it
+   * are not rejected by `forbidNonWhitelisted`, but its value is discarded.
+   */
+  @ApiPropertyOptional({
+    description: 'Ignored — the initiator is the authenticated wallet.',
+    deprecated: true,
   })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  @Validate(IsStellarAddressValidator)
-  initiator: string;
+  initiator!: string;
 
   @ApiProperty({ description: 'Reason for the dispute', minLength: 10, maxLength: 500 })
   @IsString()
   @IsNotEmpty()
   @MinLength(10)
   @MaxLength(500)
-  reason: string;
+  reason!: string;
 }
 
 export class AssignJurorsDto {
@@ -61,7 +65,7 @@ export class AssignJurorsDto {
   @IsString({ each: true })
   @IsNotEmpty({ each: true })
   @Validate(IsStellarAddressValidator, { each: true })
-  jurors: string[];
+  jurors!: string[];
 }
 
 export class CastVoteDto {
@@ -69,12 +73,12 @@ export class CastVoteDto {
   @IsString()
   @IsNotEmpty()
   @Validate(IsStellarAddressValidator)
-  jurorAddress: string;
+  jurorAddress!: string;
 
   @ApiProperty({ enum: ['depositor', 'beneficiary', 'split'] })
   @IsString()
   @IsIn(['depositor', 'beneficiary', 'split'])
-  vote: 'depositor' | 'beneficiary' | 'split';
+  vote!: 'depositor' | 'beneficiary' | 'split';
 }
 
 export class ExecutePayoutDto {

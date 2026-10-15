@@ -1,6 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { Logger } from '@nestjs/common';
-import { EscrowService, ESCROW_PERSISTENCE_FALLBACK_METRIC } from './escrow.service';
+import { Logger, ServiceUnavailableException } from '@nestjs/common';
+import {
+  EscrowService,
+  ESCROW_PERSISTENCE_FALLBACK_METRIC,
+  ESCROW_TRANSACTION_INCONSISTENT_METRIC,
+} from './escrow.service';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { MetricsService } from '../monitoring/metrics.service';
 import { makeFakeRedisClient } from '../testing/fake-redis-client';
@@ -246,8 +250,13 @@ describe('EscrowService', () => {
     // ─── raiseDispute() ───────────────────────────────────────────────────────
 
     describe('raiseDispute()', () => {
-      it('transitions a "pending" escrow to "disputed" and records reason + timestamp', async () => {
+      const activeEscrow = async () => {
         const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
+        return service.fund(escrow.id);
+      };
+
+      it('transitions an "active" escrow to "disputed" and records reason + timestamp', async () => {
+        const escrow = await activeEscrow();
         const disputed = await service.raiseDispute(escrow.id, 'Work not delivered');
 
         expect(disputed.status).toBe('disputed');
@@ -257,16 +266,29 @@ describe('EscrowService', () => {
       });
 
       it('works without a reason argument', async () => {
-        const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
+        const escrow = await activeEscrow();
         const disputed = await service.raiseDispute(escrow.id);
 
         expect(disputed.status).toBe('disputed');
         expect(disputed.disputeReason).toBeUndefined();
       });
 
+      it.each(['pending', 'cancelled'] as const)(
+        'rejects a %s escrow — only active escrows can start a dispute (#633)',
+        async status => {
+          const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
+          await service.correctStatus(escrow.id, { status });
+
+          await expect(service.raiseDispute(escrow.id, 'x')).rejects.toThrow(
+            `Cannot dispute a ${status} escrow`,
+          );
+          expect((await service.findById(escrow.id))?.status).toBe(status);
+        },
+      );
+
       it('throws when the escrow is already released (guard: cannot dispute released)', async () => {
-        const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
-        await service.release(escrow.id);
+        const escrow = await activeEscrow();
+        await service.correctStatus(escrow.id, { status: 'released' });
 
         await expect(service.raiseDispute(escrow.id, 'too late')).rejects.toThrow(
           'Cannot dispute a released escrow',
@@ -274,7 +296,7 @@ describe('EscrowService', () => {
       });
 
       it('throws when the escrow is already disputed (guard: cannot double-dispute)', async () => {
-        const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
+        const escrow = await activeEscrow();
         await service.raiseDispute(escrow.id, 'first dispute');
 
         await expect(service.raiseDispute(escrow.id, 'second dispute')).rejects.toThrow(
@@ -289,8 +311,8 @@ describe('EscrowService', () => {
       });
 
       it('does not change status when raiseDispute throws', async () => {
-        const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
-        await service.release(escrow.id);
+        const escrow = await activeEscrow();
+        await service.correctStatus(escrow.id, { status: 'released' });
 
         try {
           await service.raiseDispute(escrow.id, 'after release');
@@ -300,6 +322,24 @@ describe('EscrowService', () => {
 
         const reloaded = await service.findById(escrow.id);
         expect(reloaded?.status).toBe('released');
+      });
+    });
+
+    describe('correctStatus({ clearDispute })', () => {
+      it('restores the prior status and clears the dispute fields (#635)', async () => {
+        const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
+        await service.fund(escrow.id);
+        await service.raiseDispute(escrow.id, 'undo me');
+
+        const restored = await service.correctStatus(escrow.id, {
+          status: 'active',
+          clearDispute: true,
+        });
+
+        expect(restored.status).toBe('active');
+        expect(restored.disputeReason).toBeUndefined();
+        expect(restored.disputedAt).toBeUndefined();
+        expect((await service.findById(escrow.id))?.disputedAt).toBeUndefined();
       });
     });
 
@@ -468,25 +508,59 @@ describe('EscrowService', () => {
       });
     });
 
-    it('falls back to memory when a queued MULTI command fails without exec() itself rejecting', async () => {
+    it('refuses to report success when a queued MULTI command fails', async () => {
+      // Redis does NOT roll back the commands that already ran, so a per-command failure
+      // means part of the write is already durable. Reporting success here (and falling back
+      // to memory) is what produced inconsistent state.
       const redis = makeFakeRedisClient();
-      redis.mockNextExecResult(async () => [
-        [null, 'OK'],
-        [new Error('WRONGTYPE'), null],
-      ]);
+      redis.mockNextExecResult(() =>
+        Promise.resolve([
+          [null, 'OK'],
+          [new Error('WRONGTYPE'), null],
+        ]),
+      );
       service = await buildService(redis);
 
-      const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);
-
-      expect(escrow.status).toBe('pending');
-      expect(metrics.increment).toHaveBeenCalledWith(ESCROW_PERSISTENCE_FALLBACK_METRIC, {
+      await expect(service.create(DEPOSITOR, BENEFICIARY, AMOUNT)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(metrics.increment).toHaveBeenCalledWith(ESCROW_TRANSACTION_INCONSISTENT_METRIC, {
         operation: 'create',
+        reason: 'command-failed',
       });
+      // The in-memory fallback must NOT have been used for an integrity failure.
+      expect(metrics.increment).not.toHaveBeenCalledWith(
+        ESCROW_PERSISTENCE_FALLBACK_METRIC,
+        expect.anything(),
+      );
     });
 
-    it('falls back to memory when exec() resolves null (e.g. an aborted WATCH)', async () => {
+    it('refuses to report success when exec() resolves null (an aborted transaction)', async () => {
       const redis = makeFakeRedisClient();
-      redis.mockNextExecResult(async () => null);
+      redis.mockNextExecResult(() => Promise.resolve(null));
+      service = await buildService(redis);
+
+      await expect(service.create(DEPOSITOR, BENEFICIARY, AMOUNT)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(metrics.increment).toHaveBeenCalledWith(ESCROW_TRANSACTION_INCONSISTENT_METRIC, {
+        operation: 'create',
+        reason: 'aborted',
+      });
+      expect(metrics.increment).not.toHaveBeenCalledWith(
+        ESCROW_PERSISTENCE_FALLBACK_METRIC,
+        expect.anything(),
+      );
+    });
+
+    it('still falls back to memory for a genuine connectivity failure', async () => {
+      // A connection error means nothing was applied, so degrading is safe and keeps the
+      // app available. This is deliberately different from the two cases above.
+      const redis = makeFakeRedisClient();
+      redis.get.mockRejectedValue(new Error('Redis down'));
+      redis.multi.mockImplementation(() => {
+        throw new Error('Redis down');
+      });
       service = await buildService(redis);
 
       const escrow = await service.create(DEPOSITOR, BENEFICIARY, AMOUNT);

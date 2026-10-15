@@ -1,11 +1,5 @@
-import {
-  Inject,
-  Injectable,
-  Logger,
-  OnModuleDestroy,
-  OnModuleInit,
-  Optional,
-} from '@nestjs/common';
+import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
@@ -34,7 +28,7 @@ const MAX_EVENT_LIMIT = 200;
 
 @Injectable()
 export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(SorobanEventIndexerService.name);
+  private readonly logger = new SanitizedLogger(SorobanEventIndexerService.name);
   private rpcServer!: SorobanRpc.Server;
   private pollingInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
@@ -113,6 +107,15 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
       startLedger = oldestLedger;
     }
 
+    // Gap detection: Check if we're significantly behind the current ledger height
+    // A gap > 1 ledger indicates potential missed events due to timeouts or failures
+    const gapSize = currentLedger - cursor;
+    if (cursor > 0 && gapSize > 1) {
+      this.logger.warn(
+        `Detected ledger gap: cursor at ${cursor}, latest ledger at ${currentLedger} (gap: ${gapSize} ledgers)`,
+      );
+    }
+
     const endLedger = Math.min(currentLedger, startLedger + this.MAX_LEDGER_RANGE - 1);
 
     if (startLedger > endLedger) return [];
@@ -145,6 +148,8 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
       await this.storeEvent(event);
     }
 
+    // Only update cursor after ALL events in the batch are successfully stored
+    // This ensures atomicity: if storage fails mid-batch, we'll re-process on next poll
     await this.setCursor(endLedger);
 
     // Update the ledger lag gauge so Prometheus can alert when the indexer

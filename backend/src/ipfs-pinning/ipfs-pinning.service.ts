@@ -3,16 +3,17 @@ import {
   BadRequestException,
   Inject,
   Injectable,
-  Logger,
   NotFoundException,
   OnModuleInit,
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { CircuitBreakerService } from '../common/circuit-breaker';
 import { MetricsService } from '../monitoring/metrics.service';
+import { config } from '../config/env.config';
 import { computeCidV1Raw } from './cid.util';
 import { PinContentDto } from './ipfs-pinning.dto';
 import {
@@ -55,7 +56,7 @@ export const IPFS_UNPIN_FAILURE_METRIC = 'ipfs_unpin_failure_total';
  */
 @Injectable()
 export class IpfsPinningService implements OnModuleInit {
-  private readonly logger = new Logger(IpfsPinningService.name);
+  private readonly logger = new SanitizedLogger(IpfsPinningService.name);
 
   /** Fallback pin-record store, only used while Redis is unavailable. */
   private readonly pins = new Map<string, PinRecord>();
@@ -73,7 +74,7 @@ export class IpfsPinningService implements OnModuleInit {
   }
 
   onModuleInit(): void {
-    if (!this.redis && process.env.NODE_ENV === 'production') {
+    if (!this.redis && config.NODE_ENV === 'production') {
       throw new Error(
         'IpfsPinningService requires REDIS_URL to be configured in production — refusing to ' +
           'start with per-instance in-memory storage, which would silently diverge across instances.',
@@ -87,7 +88,7 @@ export class IpfsPinningService implements OnModuleInit {
       if (simulatedProviders.length > 0) {
         throw new Error(
           `IpfsPinningService: providers running in simulated mode in production: ${simulatedProviders.join(', ')}. ` +
-          'Set the required credentials (IPFS_PINATA_JWT, IPFS_WEB3_STORAGE_TOKEN, IPFS_INFURA_*) before deploying.',
+            'Set the required credentials (IPFS_PINATA_JWT, IPFS_WEB3_STORAGE_TOKEN, IPFS_INFURA_*) before deploying.',
         );
       }
     }
@@ -405,16 +406,14 @@ export class IpfsPinningService implements OnModuleInit {
         },
       );
     } catch (unpinError) {
-      const stillPinned = await this.circuitBreakerService.execute(
-        `ipfs-verify-${name}`,
-        async () => provider.verify(cid),
-        {
+      const stillPinned = await this.circuitBreakerService
+        .execute(`ipfs-verify-${name}`, async () => provider.verify(cid), {
           name: `ipfs-verify-${name}`,
           timeout: 30000,
           errorThresholdPercentage: 50,
           resetTimeout: 30000,
-        },
-      ).catch(() => true);
+        })
+        .catch(() => true);
 
       if (stillPinned) throw unpinError;
     }

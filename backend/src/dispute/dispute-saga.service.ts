@@ -1,7 +1,6 @@
 import {
   Inject,
   Injectable,
-  Logger,
   NotFoundException,
   BadRequestException,
   ConflictException,
@@ -9,6 +8,7 @@ import {
   ForbiddenException,
   Optional,
 } from '@nestjs/common';
+import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { AuditService } from '../audit/audit.service';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
@@ -21,11 +21,13 @@ import {
   SagaStepRecord,
 } from './dispute.types';
 import { EscalateDisputeDto, AssignJurorsDto, CastVoteDto, ExecutePayoutDto } from './dispute.dto';
-import { EscrowService } from '../escrow/escrow.service';
+import { Escrow, EscrowService } from '../escrow/escrow.service';
 import { WebhookService } from '../webhook/webhook.service';
+import { DiscordService } from '../webhook/discord.service';
 import { NotificationService } from '../notification/notification.service';
-import { ReputationOutcome } from '../reputation/reputation.types';
+import { config } from '../config/env.config';
 import { getCurrentUtcDate, toUtcIsoString } from '../common/dates';
+import { EscrowChainStateClient } from '../escrow-reconciliation/escrow-chain-state.client';
 
 /** Simple keyed mutex for serializing concurrent operations. */
 class KeyedMutex {
@@ -34,13 +36,21 @@ class KeyedMutex {
   async lock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const current = this.locks.get(key) ?? Promise.resolve();
     const next = current.then(fn);
-    this.locks.set(key, next.catch(() => {}));
+    this.locks.set(
+      key,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
     return next;
   }
 }
 
 /** Webhook event names emitted by the saga */
 export const SAGA_EVENTS = {
+  /** Public event (#636): one per dispute, full escrow payload plus `sagaId`. */
+  RAISED: 'dispute.raised',
   ESCALATED: 'dispute.escalated',
   JURORS_ASSIGNED: 'dispute.jurors_assigned',
   VOTE_CAST: 'dispute.vote_cast',
@@ -51,22 +61,26 @@ export const SAGA_EVENTS = {
   SAGA_FAILED: 'dispute.saga_failed',
 } as const;
 
-/** Maps a jury verdict onto the domain-neutral outcomes the reputation engine understands. */
-const REPUTATION_OUTCOME_BY_VERDICT: Record<
-  DisputeVerdict,
-  { depositor: ReputationOutcome; beneficiary: ReputationOutcome }
-> = {
-  [DisputeVerdict.BENEFICIARY_WINS]: { depositor: 'lost', beneficiary: 'won' },
-  [DisputeVerdict.DEPOSITOR_WINS]: { depositor: 'won', beneficiary: 'lost' },
-  [DisputeVerdict.SPLIT]: { depositor: 'split', beneficiary: 'split' },
-};
-
 const SAGA_KEY_PREFIX = 'saga:';
 const SAGAS_INDEX_KEY = 'sagas:index';
 const SAGAS_BY_ESCROW_PREFIX = 'sagas:by-escrow:';
 
 /** Emitted (see `GET /metrics`) every time a call falls back to the in-memory store. */
 export const DISPUTE_SAGA_PERSISTENCE_FALLBACK_METRIC = 'dispute_saga_persistence_fallback_total';
+
+/**
+ * Sentinel initiator for chain-originated disputes.
+ *
+ * Per #463 (docs/soroban-event-spec.md), `escrow_disputed` events carry only an
+ * escrow id and an optional `reason` — no initiator/discriminator field. This
+ * sentinel marks that absence explicitly instead of fabricating a party.
+ */
+export const CHAIN_DISPUTE_INITIATOR = 'chain:unknown';
+
+export interface EscalateOptions {
+  /** Defaults to 'api'. Chain path passes 'chain'. */
+  origin?: 'api' | 'chain';
+}
 
 /**
  * Orchestrates the dispute resolution saga (escalation → juror assignment → voting → payout),
@@ -91,7 +105,7 @@ export const DISPUTE_SAGA_PERSISTENCE_FALLBACK_METRIC = 'dispute_saga_persistenc
  */
 @Injectable()
 export class DisputeSagaService implements OnModuleInit {
-  private readonly logger = new Logger(DisputeSagaService.name);
+  private readonly logger = new SanitizedLogger(DisputeSagaService.name);
   /** Fallback saga store, only used while Redis is unavailable. */
   private readonly sagas: Map<string, DisputeSaga> = new Map();
   /** Fallback secondary index: escrowId → sagaId (one active saga per escrow). */
@@ -107,10 +121,12 @@ export class DisputeSagaService implements OnModuleInit {
     @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
     private readonly metrics: MetricsService,
     @Optional() private readonly audit?: AuditService,
+    @Optional() private readonly discordService?: DiscordService,
+    @Optional() private readonly chainClient?: EscrowChainStateClient,
   ) {}
 
   onModuleInit(): void {
-    if (!this.redis && process.env.NODE_ENV === 'production') {
+    if (!this.redis && config.NODE_ENV === 'production') {
       throw new Error(
         'DisputeSagaService requires REDIS_URL to be configured in production — refusing to ' +
           'start with per-instance in-memory storage, which would silently diverge across instances.',
@@ -158,12 +174,32 @@ export class DisputeSagaService implements OnModuleInit {
   // ─── Step 1: Escalation ───────────────────────────────────────────
 
   /**
-   * Opens a new dispute saga for an escrow.
-   * Compensating action: restore escrow status to 'active'.
+   * Opens a new dispute saga for an escrow — the single off-chain entry point
+   * for disputes (#633): the direct `POST /escrows/:id/dispute` route, the
+   * saga route and the chain handler all come through here.
+   *
+   * Ordering (#634): the saga is persisted *before* the escrow is frozen, so
+   * there is never a `disputed` escrow without a saga recorded for it:
+   *   1. persist the saga at ESCALATION (records `priorEscrowStatus`);
+   *   2. `raiseDispute()` freezes the escrow;
+   *   3. persist the saga at JUROR_ASSIGNMENT.
+   * A failure at 1 changes nothing; at 2 or 3 the saga is marked FAILED and
+   * only the change this call made is reverted (#635). A crash between 2 and 3
+   * leaves the saga at ESCALATION — still an active saga for the escrow, so
+   * the dispute is never orphaned.
+   *
+   * Notifications (#636) are sent once, after step 3 commits, and a delivery
+   * failure never un-does a committed dispute.
+   *
    * Serialized per escrow to prevent double escalation.
    */
-  async escalate(escrowId: string, dto: EscalateDisputeDto): Promise<DisputeSaga> {
-    return this.escalateMutex.lock(escrowId, async () => {
+  async escalate(
+    escrowId: string,
+    dto: EscalateDisputeDto,
+    opts: EscalateOptions = {},
+  ): Promise<DisputeSaga> {
+    const origin = opts.origin ?? 'api';
+    const { saga, escrow } = await this.escalateMutex.lock(escrowId, async () => {
       // Guard: only one active saga per escrow
       const existing = await this.findByEscrowId(escrowId);
       if (
@@ -174,81 +210,188 @@ export class DisputeSagaService implements OnModuleInit {
         throw new ConflictException(`An active dispute saga already exists for escrow ${escrowId}`);
       }
 
-    const escrow = await this.escrowService.findById(escrowId);
-    if (!escrow) throw new NotFoundException(`Escrow ${escrowId} not found`);
-    if (escrow.status === 'released') {
-      throw new BadRequestException('Cannot dispute a released escrow');
-    }
+      const escrow = await this.escrowService.findById(escrowId);
+      if (!escrow) throw new NotFoundException(`Escrow ${escrowId} not found`);
+      // Only an active escrow can start a new dispute. An escrow that is already
+      // `disputed` with no active saga (an orphan from before #633) is adopted
+      // rather than rejected: that is not a new dispute, just a missing saga.
+      if (escrow.status !== 'active' && escrow.status !== 'disputed') {
+        throw new BadRequestException(`Cannot dispute a ${escrow.status} escrow`);
+      }
 
-    // Verify that initiator is either depositor or beneficiary
-    if (dto.initiator !== escrow.depositor && dto.initiator !== escrow.beneficiary) {
-      throw new ForbiddenException(
-        'Only the depositor or beneficiary can escalate a dispute for this escrow',
-      );
-    }
+      // Verify that initiator is either depositor or beneficiary, unless this is a
+      // chain-originated dispute with no reliable initiator (#463): the sentinel
+      // CHAIN_DISPUTE_INITIATOR is the only non-party value accepted.
+      const isChainUnknown = origin === 'chain' && dto.initiator === CHAIN_DISPUTE_INITIATOR;
+      if (!isChainUnknown) {
+        if (dto.initiator !== escrow.depositor && dto.initiator !== escrow.beneficiary) {
+          throw new ForbiddenException(
+            'Only the depositor or beneficiary can escalate a dispute for this escrow',
+          );
+        }
+      }
 
-    const sagaId = `saga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const now = toUtcIsoString(getCurrentUtcDate());
+      const sagaId = `saga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const now = toUtcIsoString(getCurrentUtcDate());
 
-    const saga: DisputeSaga = {
-      sagaId,
-      escrowId,
-      initiator: dto.initiator,
-      reason: dto.reason,
-      currentStep: DisputeStep.ESCALATION,
-      votes: [],
-      stepHistory: [],
-      createdAt: now,
-      updatedAt: now,
-    };
+      const saga: DisputeSaga = {
+        sagaId,
+        escrowId,
+        initiator: dto.initiator,
+        origin,
+        reason: dto.reason,
+        priorEscrowStatus: escrow.status,
+        currentStep: DisputeStep.ESCALATION,
+        votes: [],
+        stepHistory: [],
+        createdAt: now,
+        updatedAt: now,
+      };
 
-    this.recordStepStart(saga, DisputeStep.ESCALATION);
+      this.recordStepStart(saga, DisputeStep.ESCALATION);
 
-    try {
-      // Freeze the escrow by marking it disputed
-      await this.escrowService.raiseDispute(escrowId, dto.reason);
-
-      // Simulate on-chain escalation tx hash
-      saga.escalationTxHash = `escalation-tx-${sagaId}`;
-      this.recordStepComplete(saga, DisputeStep.ESCALATION);
-      saga.currentStep = DisputeStep.JUROR_ASSIGNMENT;
-      this.touch(saga);
-
+      // Step 1: record the saga before touching the escrow. Nothing to undo if
+      // this fails — the escrow has not been changed.
       await this.createSaga(saga);
 
-      if (this.audit) {
-        await this.audit.logOperation({
+      // What this call changed, so compensation reverts only that (#635).
+      let frozen: Escrow | undefined;
+      try {
+        // Step 2: freeze the escrow, unless adopting an already-disputed one.
+        if (escrow.status !== 'disputed') {
+          frozen = await this.escrowService.raiseDispute(escrowId, dto.reason, dto.initiator);
+        }
+
+        // Placeholder until the on-chain write path lands (#180) — not a chain reference.
+        saga.escalationTxHash = `escalation-tx-${sagaId}`;
+        this.recordStepComplete(saga, DisputeStep.ESCALATION);
+        saga.currentStep = DisputeStep.JUROR_ASSIGNMENT;
+        this.touch(saga);
+
+        // Step 3: commit the saga's progress.
+        await this.persistSaga(saga);
+      } catch (error) {
+        await this.compensateEscalation(saga, error, frozen);
+        throw error;
+      }
+
+      this.logger.log(`Saga ${sagaId}: escalation complete for escrow ${escrowId}`);
+      return { saga, escrow: frozen ?? escrow };
+    });
+
+    await this.afterEscalation(saga, escrow);
+    return saga;
+  }
+
+  /**
+   * Post-commit side effects of a successful escalation — sent exactly once
+   * per dispute, whatever the entry point (#636). Each is log-and-continue:
+   * the dispute is already committed, so a delivery failure must not undo it.
+   */
+  private async afterEscalation(saga: DisputeSaga, escrow: Escrow): Promise<void> {
+    const { sagaId, escrowId } = saga;
+    const bestEffort = async (what: string, fn: () => Promise<unknown>) => {
+      try {
+        await fn();
+      } catch (err) {
+        this.logger.error(`Saga ${sagaId}: ${what} failed after escalation`, err);
+      }
+    };
+
+    if (this.audit) {
+      await bestEffort('audit log', () =>
+        this.audit!.logOperation({
           operation: 'DISPUTE_ESCALATE',
-          user: dto.initiator,
+          user: saga.initiator,
           entityId: sagaId,
           entityType: 'dispute_saga',
           beforeState: null,
           afterState: saga,
-          metadata: { escrowId, reason: dto.reason }
-        }).catch(err => this.logger.error('Failed to write audit log', err));
-      }
+          metadata: { escrowId, reason: saga.reason },
+        }),
+      );
+    }
 
-      await this.webhookService.dispatch(SAGA_EVENTS.ESCALATED, { sagaId, escrowId });
-      await this.notificationService.notifyDisputeEscalated({
+    // Public event: the payload the direct route used to send, plus sagaId.
+    await bestEffort(SAGA_EVENTS.RAISED, () =>
+      this.webhookService.dispatch(SAGA_EVENTS.RAISED, {
+        escrowId,
+        depositor: escrow.depositor,
+        beneficiary: escrow.beneficiary,
+        amountXLM: escrow.amountXLM,
+        reason: saga.reason,
+        disputedAt: escrow.disputedAt,
+        sagaId,
+      }),
+    );
+    // Internal saga event.
+    await bestEffort(SAGA_EVENTS.ESCALATED, () =>
+      this.webhookService.dispatch(SAGA_EVENTS.ESCALATED, { sagaId, escrowId }),
+    );
+    if (this.discordService) {
+      await bestEffort('Discord notification', () =>
+        this.discordService!.notifyDisputeNeedsJurors({
+          escrowId,
+          depositor: escrow.depositor,
+          beneficiary: escrow.beneficiary,
+          amountXLM: escrow.amountXLM,
+          reason: saga.reason,
+        }),
+      );
+    }
+    await bestEffort('in-app notification', () =>
+      this.notificationService.notifyDisputeEscalated({
         escrowId,
         disputeId: sagaId,
         depositor: escrow.depositor,
         beneficiary: escrow.beneficiary,
-        reason: dto.reason,
-      });
+        reason: saga.reason,
+      }),
+    );
+  }
 
-      this.logger.log(`Saga ${sagaId}: escalation complete for escrow ${escrowId}`);
-      return saga;
-    } catch (error) {
-      await this.compensateEscalation(saga, error);
-      throw error;
+  /**
+   * Chain entry point for `escrow_disputed` events. Per #463 the event cannot
+   * reliably identify an initiator, so no party is fabricated: the saga is
+   * recorded with the `chain:unknown` sentinel and `origin: 'chain'`.
+   * Idempotent per escrow — returns the existing active saga on re-delivery.
+   */
+  async escalateFromChain(escrowId: string, reason: string): Promise<DisputeSaga> {
+    const existing = await this.findByEscrowId(escrowId);
+    if (
+      existing &&
+      existing.currentStep !== DisputeStep.FAILED &&
+      existing.currentStep !== DisputeStep.COMPLETED
+    ) {
+      this.logger.warn(`Chain dispute for escrow ${escrowId} already has saga ${existing.sagaId}`);
+      return existing;
     }
-    });
+    return this.escalate(
+      escrowId,
+      { initiator: CHAIN_DISPUTE_INITIATOR, reason } as EscalateDisputeDto,
+      { origin: 'chain' },
+    );
   }
 
   // ─── Compensating action for Step 1 ──────────────────────────────
 
-  private async compensateEscalation(saga: DisputeSaga, error: unknown): Promise<void> {
+  /**
+   * Reverts only what this saga's escalation changed (#635). `frozen` is the
+   * escrow as this saga's own `raiseDispute()` left it, or undefined if that
+   * call never succeeded (it threw, or the escrow was adopted already
+   * disputed) — in which case the escrow is left exactly as it is, so a
+   * dispute raised by another path or saga is never undone.
+   *
+   * #647: if an on-chain transaction succeeded but the DB write failed, this
+   * compensation re-reads the chain state and syncs the DB to match. This
+   * ensures the saga state reflects the canonical on-chain contract state even
+   * when local persistence fails.
+   */
+  private async compensateEscalation(
+    saga: DisputeSaga,
+    error: unknown,
+    frozen: Escrow | undefined,
+  ): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
     this.logger.warn(`Saga ${saga.sagaId}: compensating escalation — ${reason}`);
     this.recordStepFailed(saga, DisputeStep.ESCALATION, reason);
@@ -256,10 +399,41 @@ export class DisputeSagaService implements OnModuleInit {
     saga.compensationReason = reason;
 
     try {
-      // Compensating action: revert escrow status to active
+      // #647: If the escalation reached the chain but the DB write failed, re-read the
+      // canonical chain state and sync the DB to match. This prevents desynchronization
+      // where the contract is disputed but off-chain records remain active.
       const escrow = await this.escrowService.findById(saga.escrowId);
-      if (escrow && escrow.status === 'disputed') {
-        await this.escrowService.correctStatus(saga.escrowId, { status: 'active' });
+      if (escrow?.contractEscrowId && this.chainClient) {
+        try {
+          await this.syncEscrowFromChain(escrow.contractEscrowId);
+          this.logger.log(
+            `Saga ${saga.sagaId}: re-synced escrow ${saga.escrowId} from chain state after escalation failure`,
+          );
+        } catch (syncErr) {
+          this.logger.error(
+            `Saga ${saga.sagaId}: failed to sync escrow from chain during compensation`,
+            syncErr,
+          );
+          // Continue with the local revert — a failed sync is logged but shouldn't block compensation.
+        }
+      }
+
+      if (frozen) {
+        const currentEscrow = await this.escrowService.findById(saga.escrowId);
+        // Still the dispute this saga raised (same disputedAt) — restore the
+        // recorded prior status. Anything else means someone has changed the
+        // escrow since, and it is theirs to keep.
+        if (
+          currentEscrow &&
+          currentEscrow.status === 'disputed' &&
+          currentEscrow.disputedAt === frozen.disputedAt &&
+          saga.priorEscrowStatus
+        ) {
+          await this.escrowService.correctStatus(saga.escrowId, {
+            status: saga.priorEscrowStatus as Escrow['status'],
+            clearDispute: true,
+          });
+        }
       }
       this.recordStepCompensated(saga, DisputeStep.ESCALATION);
     } catch (compError) {
@@ -267,13 +441,65 @@ export class DisputeSagaService implements OnModuleInit {
     }
 
     this.markFailed(saga, reason);
-    // The saga never made it past its first successful write on this path, so persist it now.
-    await this.persistSaga(saga);
+    try {
+      await this.persistSaga(saga);
+    } catch (persistError) {
+      this.logger.error(`Saga ${saga.sagaId}: could not record failed escalation`, persistError);
+    }
     await this.webhookService.dispatch(SAGA_EVENTS.SAGA_FAILED, {
       sagaId: saga.sagaId,
       reason,
       step: DisputeStep.ESCALATION,
     });
+  }
+
+  /**
+   * Re-reads the canonical on-chain state for an escrow and updates the DB to match.
+   * Used by compensating actions when an on-chain write succeeded but the local DB
+   * update failed, preventing desynchronization between chain and off-chain state.
+   *
+   * #647: This is the recovery mechanism that ensures dispute saga state always reflects
+   * the true on-chain contract state, even when database failures occur mid-transaction.
+   */
+  private async syncEscrowFromChain(contractEscrowId: string): Promise<void> {
+    if (!this.chainClient) {
+      this.logger.warn(
+        `Cannot sync escrow ${contractEscrowId} from chain: no chain client available`,
+      );
+      return;
+    }
+
+    const chainState = await this.chainClient.getEscrow(contractEscrowId);
+    if (!chainState) {
+      this.logger.warn(
+        `Chain returned no state for escrow contract ${contractEscrowId} — may have been deleted on-chain`,
+      );
+      return;
+    }
+
+    // Find the off-chain escrow by its contract ID
+    const escrows = await this.escrowService.findAll();
+    const escrow = escrows.find(e => e.contractEscrowId === contractEscrowId);
+
+    if (!escrow) {
+      this.logger.warn(
+        `No off-chain escrow found for contract ${contractEscrowId} — skipping sync`,
+      );
+      return;
+    }
+
+    // Sync the status if it differs
+    if (escrow.status !== chainState.status) {
+      this.logger.log(
+        `Syncing escrow ${escrow.id} status from ${escrow.status} to ${chainState.status} (chain is authoritative)`,
+      );
+      await this.escrowService.applyChainState(escrow.id, { status: chainState.status });
+    }
+
+    // If the chain shows the escrow is disputed, ensure the off-chain record reflects that
+    if (chainState.status === 'disputed' && escrow.status !== 'disputed') {
+      await this.escrowService.applyChainState(escrow.id, { status: 'disputed' });
+    }
   }
 
   // ─── Step 2: Juror Assignment ─────────────────────────────────────
@@ -288,49 +514,49 @@ export class DisputeSagaService implements OnModuleInit {
       const saga = await this.findById(sagaId);
       this.assertStep(saga, DisputeStep.JUROR_ASSIGNMENT);
 
-    // Validate input before initializing the step to avoid treating input errors as infrastructure failures
-    const unique = [...new Set(dto.jurors)];
-    if (unique.length < 3) {
-      throw new BadRequestException('At least 3 distinct juror addresses are required');
-    }
+      // Validate input before initializing the step to avoid treating input errors as infrastructure failures
+      const unique = [...new Set(dto.jurors)];
+      if (unique.length < 3) {
+        throw new BadRequestException('At least 3 distinct juror addresses are required');
+      }
 
-    // Prevent escrow parties from being assigned as jurors to avoid conflicts of interest
-    const escrow = await this.escrowService.findById(saga.escrowId);
-    if (escrow) {
-      for (const juror of unique) {
-        if (juror === escrow.depositor || juror === escrow.beneficiary) {
-          throw new BadRequestException(
-            'Escrow parties (depositor and beneficiary) cannot be assigned as jurors',
-          );
+      // Prevent escrow parties from being assigned as jurors to avoid conflicts of interest
+      const escrow = await this.escrowService.findById(saga.escrowId);
+      if (escrow) {
+        for (const juror of unique) {
+          if (juror === escrow.depositor || juror === escrow.beneficiary) {
+            throw new BadRequestException(
+              'Escrow parties (depositor and beneficiary) cannot be assigned as jurors',
+            );
+          }
         }
       }
-    }
 
-    this.recordStepStart(saga, DisputeStep.JUROR_ASSIGNMENT);
+      this.recordStepStart(saga, DisputeStep.JUROR_ASSIGNMENT);
 
-    try {
-      saga.assignedJurors = unique;
-      this.recordStepComplete(saga, DisputeStep.JUROR_ASSIGNMENT);
-      saga.currentStep = DisputeStep.VOTING;
-      this.touch(saga);
-      await this.persistSaga(saga);
+      try {
+        saga.assignedJurors = unique;
+        this.recordStepComplete(saga, DisputeStep.JUROR_ASSIGNMENT);
+        saga.currentStep = DisputeStep.VOTING;
+        this.touch(saga);
+        await this.persistSaga(saga);
 
-      await this.webhookService.dispatch(SAGA_EVENTS.JURORS_ASSIGNED, {
-        sagaId,
-        jurors: unique,
-      });
-      await this.notificationService.notifyJurorsAssigned({
-        disputeId: sagaId,
-        escrowId: saga.escrowId,
-        jurors: unique,
-      });
+        await this.webhookService.dispatch(SAGA_EVENTS.JURORS_ASSIGNED, {
+          sagaId,
+          jurors: unique,
+        });
+        await this.notificationService.notifyJurorsAssigned({
+          disputeId: sagaId,
+          escrowId: saga.escrowId,
+          jurors: unique,
+        });
 
-      this.logger.log(`Saga ${sagaId}: ${unique.length} jurors assigned`);
-      return saga;
-    } catch (error) {
-      await this.compensateJurorAssignment(saga, error);
-      throw error;
-    }
+        this.logger.log(`Saga ${sagaId}: ${unique.length} jurors assigned`);
+        return saga;
+      } catch (error) {
+        await this.compensateJurorAssignment(saga, error);
+        throw error;
+      }
     });
   }
 
@@ -396,11 +622,11 @@ export class DisputeSagaService implements OnModuleInit {
           sagaId,
           jurorAddress: dto.jurorAddress,
           votesIn: saga.votes.length,
-          votesNeeded: saga.assignedJurors!.length,
+          votesNeeded: saga.assignedJurors.length,
         });
 
         // All jurors have voted — compute verdict (exactly once)
-        if (saga.votes.length === saga.assignedJurors!.length && !saga.verdict) {
+        if (saga.votes.length === saga.assignedJurors.length && !saga.verdict) {
           const verdict = this.computeVerdict(saga.votes);
           saga.verdict = verdict;
           this.recordStepComplete(saga, DisputeStep.VOTING);
@@ -509,15 +735,17 @@ export class DisputeSagaService implements OnModuleInit {
         await this.persistSaga(saga);
 
         if (this.audit) {
-          await this.audit.logOperation({
-            operation: 'DISPUTE_PAYOUT',
-            user: 'admin',
-            entityId: sagaId,
-            entityType: 'dispute_saga',
-            beforeState,
-            afterState: saga,
-            metadata: { verdict: saga.verdict, splitPercentage: dto.splitPercentage }
-          }).catch(err => this.logger.error('Failed to write audit log', err));
+          await this.audit
+            .logOperation({
+              operation: 'DISPUTE_PAYOUT',
+              user: 'admin',
+              entityId: sagaId,
+              entityType: 'dispute_saga',
+              beforeState,
+              afterState: saga,
+              metadata: { verdict: saga.verdict, splitPercentage: dto.splitPercentage },
+            })
+            .catch(err => this.logger.error('Failed to write audit log', err));
         }
 
         await this.webhookService.dispatch(SAGA_EVENTS.PAYOUT_EXECUTED, {
