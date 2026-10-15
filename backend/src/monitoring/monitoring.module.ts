@@ -5,12 +5,28 @@ import { HealthController } from './health.controller';
 import { MetricsHttpInterceptor } from './metrics-http.interceptor';
 import { RequestTimeoutInterceptor } from '../common/http/request-timeout.interceptor';
 import { DatabaseModule } from '../common/database/database.module';
+import { SorobanMetricsService } from './soroban-metrics.service';
+import { SorobanRpcMetricsInterceptor } from './soroban-rpc-metrics.interceptor';
 
 @Global()
 @Module({
   imports: [DatabaseModule],
   controllers: [HealthController],
-  providers: [HealthService, MetricsService, MetricsHttpInterceptor, RequestTimeoutInterceptor],
-  exports: [HealthService, MetricsService, MetricsHttpInterceptor, RequestTimeoutInterceptor],
+  providers: [
+    HealthService,
+    MetricsService,
+    MetricsHttpInterceptor,
+    RequestTimeoutInterceptor,
+    SorobanMetricsService,
+    SorobanRpcMetricsInterceptor,
+  ],
+  exports: [
+    HealthService,
+    MetricsService,
+    MetricsHttpInterceptor,
+    RequestTimeoutInterceptor,
+    SorobanMetricsService,
+    SorobanRpcMetricsInterceptor,
+  ],
 })
 export class MonitoringModule {}

@@ -1,10 +1,19 @@
-import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
 import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { getStellarConfig } from '../stellar/stellar.config';
 import { config } from '../config/env.config';
 import { buildSorobanServer } from '../stellar/soroban.helper';
+import { SorobanMetricsService } from '../monitoring/soroban-metrics.service';
+import { wrapSorobanRpc } from '../monitoring/soroban-rpc-metrics.interceptor';
 
 export interface IndexedSorobanEvent {
   eventId: string;
@@ -33,7 +42,10 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
   private readonly POLL_INTERVAL_MS = 10_000;
   private readonly MAX_LEDGER_RANGE = 100;
 
-  constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis | null) {}
+  constructor(
+    @Inject(REDIS_CLIENT) private readonly redis: Redis | null,
+    @Optional() private readonly sorobanMetrics?: SorobanMetricsService,
+  ) {}
 
   onModuleInit() {
     this.rpcServer = buildSorobanServer(getStellarConfig().sorobanRpcUrl);
@@ -111,7 +123,11 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
       limit: 100,
     };
 
-    const response = (await this.rpcServer.getEvents(getEventsParams)) as any;
+    const response = (await (this.sorobanMetrics
+      ? wrapSorobanRpc(this.sorobanMetrics, 'getEvents', () =>
+          this.rpcServer.getEvents(getEventsParams),
+        )
+      : this.rpcServer.getEvents(getEventsParams))) as any;
 
     const events: IndexedSorobanEvent[] = [];
     for (const raw of response.events) {
@@ -130,6 +146,12 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
     }
 
     await this.setCursor(endLedger);
+
+    // Update the ledger lag gauge so Prometheus can alert when the indexer
+    // falls behind the chain tip.
+    if (this.sorobanMetrics) {
+      this.sorobanMetrics.setIndexerLedgerLag(currentLedger - endLedger);
+    }
 
     if (events.length > 0) {
       this.logger.log(`Indexed ${events.length} events from ledgers ${startLedger}-${endLedger}`);
@@ -191,7 +213,9 @@ export class SorobanEventIndexerService implements OnModuleInit, OnModuleDestroy
 
   private async getLedgerBounds(): Promise<{ latestLedger: number; oldestLedger: number }> {
     try {
-      const response = await this.rpcServer.getHealth();
+      const response = await (this.sorobanMetrics
+        ? wrapSorobanRpc(this.sorobanMetrics, 'getHealth', () => this.rpcServer.getHealth())
+        : this.rpcServer.getHealth());
       if (response && typeof response === 'object') {
         const anyResp = response as any;
         return {

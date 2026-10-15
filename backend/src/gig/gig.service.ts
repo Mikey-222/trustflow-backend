@@ -175,6 +175,15 @@ export class GigService implements OnModuleInit {
     return { data, total };
   }
 
+  /**
+   * Return all gigs with the given status.
+   * Used by the milestone expiry scheduler to find open gigs nearing deadline.
+   */
+  async findByStatus(status: GigStatus): Promise<Gig[]> {
+    const all = await this.findAll();
+    return all.filter(g => g.status === status);
+  }
+
   /** Open gig solicitations whose response deadline has passed as of `now`. */
   async findExpirable(now: Date = new Date()): Promise<Gig[]> {
     if (this.redis) {
@@ -237,10 +246,7 @@ export class GigService implements OnModuleInit {
     return result;
   }
 
-  private async mutateWithRetry<T>(
-    id: string,
-    operation: (gig: Gig) => Promise<T>,
-  ): Promise<T> {
+  private async mutateWithRetry<T>(id: string, operation: (gig: Gig) => Promise<T>): Promise<T> {
     const maxRetries = 3;
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -255,7 +261,11 @@ export class GigService implements OnModuleInit {
       const gig = await this.tryFindById(id);
       if (!gig) {
         if (this.redis) {
-          try { await this.redis.unwatch(); } catch (err) { /* ignore */ }
+          try {
+            await this.redis.unwatch();
+          } catch (err) {
+            /* ignore */
+          }
         }
         throw new NotFoundException(`Gig ${id} not found`);
       }
@@ -267,15 +277,23 @@ export class GigService implements OnModuleInit {
         if (!this.redis) {
           const inMem = this.gigs.get(id);
           if (inMem && inMem.version !== currentVersion + 1) {
-             throw new Error('In-memory transaction aborted');
+            throw new Error('In-memory transaction aborted');
           }
         }
         return result;
       } catch (err: any) {
         if (this.redis) {
-          try { await this.redis.unwatch(); } catch (e) { /* ignore */ }
+          try {
+            await this.redis.unwatch();
+          } catch (e) {
+            /* ignore */
+          }
         }
-        if (err.message?.includes('transaction aborted') || err.message?.includes('transaction command failed') || err.message?.includes('In-memory transaction aborted')) {
+        if (
+          err.message?.includes('transaction aborted') ||
+          err.message?.includes('transaction command failed') ||
+          err.message?.includes('In-memory transaction aborted')
+        ) {
           lastError = err;
           continue;
         }
@@ -286,7 +304,7 @@ export class GigService implements OnModuleInit {
   }
 
   async accept(id: string, responder: string): Promise<Gig> {
-    return this.mutateWithRetry(id, async (gig) => {
+    return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) {
         throw new ConflictException(`Cannot accept a gig with status "${gig.status}"`);
       }
@@ -300,7 +318,7 @@ export class GigService implements OnModuleInit {
   }
 
   async cancel(id: string): Promise<Gig> {
-    return this.mutateWithRetry(id, async (gig) => {
+    return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) {
         throw new ConflictException(`Cannot cancel a gig with status "${gig.status}"`);
       }
@@ -313,14 +331,16 @@ export class GigService implements OnModuleInit {
   }
 
   async update(id: string, dto: UpdateGigDto): Promise<Gig> {
-    return this.mutateWithRetry(id, async (gig) => {
+    return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) {
         throw new ConflictException(`Cannot update a gig with status "${gig.status}"`);
       }
       if (dto.title !== undefined) gig.title = dto.title;
       if (dto.budgetXLM !== undefined) gig.budgetXLM = dto.budgetXLM;
       if (dto.responseWindowHours !== undefined) {
-        gig.respondBy = new Date(Date.now() + dto.responseWindowHours * 60 * 60 * 1000).toISOString();
+        gig.respondBy = new Date(
+          Date.now() + dto.responseWindowHours * 60 * 60 * 1000,
+        ).toISOString();
       }
       gig.version = (gig.version || 1) + 1;
       await this.persistGig(gig);
@@ -329,7 +349,7 @@ export class GigService implements OnModuleInit {
   }
 
   async remove(id: string): Promise<void> {
-    return this.mutateWithRetry(id, async (gig) => {
+    return this.mutateWithRetry(id, async gig => {
       if (gig.status === GigStatus.ACCEPTED) {
         throw new ConflictException('Cannot delete an accepted gig');
       }
@@ -346,7 +366,10 @@ export class GigService implements OnModuleInit {
           await this.invalidateSearchCache();
           return;
         } catch (err: any) {
-          if (err.message?.includes('transaction aborted') || err.message?.includes('transaction command failed')) {
+          if (
+            err.message?.includes('transaction aborted') ||
+            err.message?.includes('transaction command failed')
+          ) {
             throw err;
           }
           this.logFallback('remove', err);
@@ -362,7 +385,7 @@ export class GigService implements OnModuleInit {
    * resolved by the time the sweep reached it. Used by the expiry sweep worker.
    */
   async expire(id: string): Promise<Gig | undefined> {
-    return this.mutateWithRetry(id, async (gig) => {
+    return this.mutateWithRetry(id, async gig => {
       if (gig.status !== GigStatus.OPEN) return undefined;
       gig.status = GigStatus.EXPIRED;
       gig.expiredAt = new Date().toISOString();
@@ -387,7 +410,10 @@ export class GigService implements OnModuleInit {
         await this.invalidateSearchCache();
         return;
       } catch (err: any) {
-        if (err.message?.includes('transaction aborted') || err.message?.includes('transaction command failed')) {
+        if (
+          err.message?.includes('transaction aborted') ||
+          err.message?.includes('transaction command failed')
+        ) {
           throw err;
         }
         this.logFallback('persistResolved', err);
@@ -417,7 +443,10 @@ export class GigService implements OnModuleInit {
         await this.invalidateSearchCache();
         return;
       } catch (err: any) {
-        if (err.message?.includes('transaction aborted') || err.message?.includes('transaction command failed')) {
+        if (
+          err.message?.includes('transaction aborted') ||
+          err.message?.includes('transaction command failed')
+        ) {
           throw err;
         }
         this.logFallback('persistGig', err);

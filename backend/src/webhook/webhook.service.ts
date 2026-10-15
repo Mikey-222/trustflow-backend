@@ -26,9 +26,34 @@ export interface WebhookEndpointConfig {
 
 /**
  * Computes an HMAC-SHA256 hex signature for a given payload body string and secret.
+ *
+ * Signature format: `t=<unix_ms>,v1=<hex_hmac>`
+ *
+ * The signed content is `<timestamp>.<payloadBody>` — binding the timestamp into
+ * the MAC prevents replay attacks: a receiver that rejects events older than N
+ * seconds will refuse a stolen payload even if the attacker re-sends it later.
+ *
+ * @param payloadBody - Raw JSON body string of the webhook payload
+ * @param secret      - Endpoint signing secret (min 16 chars, hex or arbitrary)
+ * @param timestampMs - Unix epoch milliseconds; defaults to Date.now()
+ * @returns           - Signature header value ready to set on `X-TrustFlow-Signature`
  */
-export function computeWebhookSignature(payloadBody: string, secret: string): string {
-  return crypto.createHmac('sha256', secret).update(payloadBody, 'utf8').digest('hex');
+export function computeWebhookSignature(
+  payloadBody: string,
+  secret: string,
+  timestampMs: number = Date.now(),
+): string {
+  const signedContent = `${timestampMs}.${payloadBody}`;
+  const hmac = crypto.createHmac('sha256', secret).update(signedContent, 'utf8').digest('hex');
+  return `t=${timestampMs},v1=${hmac}`;
+}
+
+/**
+ * Generates a cryptographically random webhook signing secret (32 bytes → 64 hex chars).
+ * Used when the caller does not supply their own secret at registration time.
+ */
+export function generateWebhookSecret(): string {
+  return crypto.randomBytes(32).toString('hex');
 }
 
 /**
@@ -178,10 +203,26 @@ export class WebhookService {
     @Inject(forwardRef(() => OutboxService)) private readonly outboxService: OutboxService,
   ) {}
 
-  async register(id: string, url: string, secret?: string) {
+  /**
+   * Registers a webhook endpoint and ensures it has a signing secret.
+   *
+   * If the caller supplies a `secret` it is used as-is (must be ≥ 16 chars,
+   * enforced by `RegisterWebhookSchema`). When no secret is provided one is
+   * generated with `generateWebhookSecret()` — 32 random bytes encoded as hex.
+   *
+   * The secret is returned in the registration response so the caller can store
+   * it; it is never exposed again after this call.
+   *
+   * @returns The (potentially auto-generated) signing secret so the caller can
+   *          configure their receiver.
+   */
+  async register(id: string, url: string, secret?: string): Promise<string> {
     await validateWebhookUrl(url);
-    this.endpoints.set(id, { url, secret });
+    const signingSecret = secret ?? generateWebhookSecret();
+    this.endpoints.set(id, { url, secret: signingSecret });
+    return signingSecret;
   }
+
   unregister(id: string) {
     this.endpoints.delete(id);
   }
@@ -242,7 +283,9 @@ export class WebhookService {
         'Content-Length': Buffer.byteLength(body, 'utf8'),
       };
       if (secret) {
-        headers['X-TrustFlow-Signature'] = computeWebhookSignature(body, secret);
+        // Bind the current timestamp into the signature to enable replay-attack
+        // prevention on the receiver side (reject events older than ~5 minutes).
+        headers['X-TrustFlow-Signature'] = computeWebhookSignature(body, secret, Date.now());
       }
 
       const req = mod.request(

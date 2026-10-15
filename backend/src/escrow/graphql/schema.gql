@@ -1,0 +1,81 @@
+# ------------------------------------------------------
+# THIS FILE WAS AUTOMATICALLY GENERATED (DO NOT MODIFY)
+# ------------------------------------------------------
+
+type Deliverable {
+  cid: String!
+  createdAt: String!
+  filename: String!
+  freelancer: String!
+  gigId: String!
+  id: ID!
+  jurorVotes: [JurorVote!]
+  milestoneId: String!
+  size: Float!
+  status: String!
+  updatedAt: String!
+}
+
+type Escrow {
+  amountXLM: String!
+  beneficiary: String!
+  beneficiaryProfile: UserProfile
+  contractEscrowId: String
+  createdAt: String!
+  depositor: String!
+  depositorProfile: UserProfile
+  disputeReason: String
+  disputedAt: String
+  id: ID!
+  milestones: [Milestone!]
+  splitPercentage: Float
+  status: String!
+  stellarTxHash: String
+}
+
+type JurorVote {
+  createdAt: String!
+  deliverableId: String!
+  id: ID!
+  juror: String!
+  rationale: String
+  vote: String!
+}
+
+type Milestone {
+  amountXLM: String!
+  completedAt: String
+  deliverables: [Deliverable!]
+  description: String
+  dueDate: String
+  escrowId: String!
+  id: ID!
+  status: String!
+  title: String!
+}
+
+type Query {
+  escrow(id: String!): Escrow
+  escrows: [Escrow!]!
+}
+
+type UserProfile {
+  avatarUrl: String
+  bio: String
+  completedJobs: Float!
+  createdAt: String!
+  email: String
+  id: ID!
+  isVerified: Boolean!
+  lastActiveAt: String
+  name: String!
+  rating: Float!
+  ratingCount: Float!
+  skills: [String!]
+  status: String!
+  totalEarned: String
+  totalSpent: String
+  updatedAt: String!
+  userType: String!
+  walletAddress: String!
+}

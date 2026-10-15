@@ -46,10 +46,10 @@ export class WebhookController {
         },
         secret: {
           type: 'string',
-          minLength: 16,
           description:
-            'Optional HMAC secret (min 16 characters) used to sign outgoing webhook payloads via the X-TrustFlow-Signature header',
-          example: 'your-16-plus-character-secret',
+            'Auto-generated HMAC-SHA256 signing secret (returned only once — store it securely). ' +
+            'If you supplied your own secret it is echoed back here so you can confirm it was accepted.',
+          example: 'a3f9c2...64-hex-chars',
         },
       },
     },
@@ -62,14 +62,26 @@ export class WebhookController {
       properties: {
         registered: { type: 'boolean', example: true },
         id: { type: 'string', example: 'my-webhook-1' },
+        signingSecret: {
+          type: 'string',
+          description:
+            'HMAC-SHA256 signing secret for this endpoint. ' +
+            'Store this securely — it is returned only at registration time. ' +
+            'All outgoing payloads are signed with X-TrustFlow-Signature: t=<ms>,v1=<hex>.',
+          example: 'a3f9c2d1e4b5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1',
+        },
       },
     },
   })
   @ApiResponse({ status: 400, description: 'Invalid webhook URL, ID, or secret' })
   async register(@Body() body: RegisterWebhookDto) {
     const validated = RegisterWebhookSchema.parse(body);
-    await this.webhookService.register(validated.id, validated.url, validated.secret);
-    return { registered: true, id: validated.id };
+    const signingSecret = await this.webhookService.register(
+      validated.id,
+      validated.url,
+      validated.secret,
+    );
+    return { registered: true, id: validated.id, signingSecret };
   }
 
   @Delete(':id')
