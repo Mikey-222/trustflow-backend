@@ -1,12 +1,21 @@
 import { z } from 'zod';
 import { GigStatus, MAX_GIG_SEARCH_LIMIT } from './gig.entity';
+import { XLM_AMOUNT_FORMAT_MESSAGE, XLM_AMOUNT_REGEX } from '../common/amount';
 
 const STELLAR_ADDRESS_REGEX = /^G[A-Z2-7]{55}$/;
+
+/**
+ * Single source of truth for every XLM amount accepted on a gig. Rejects more than
+ * 7 fractional digits up front instead of letting escrow funding round them away.
+ */
+const XlmAmountSchema = z.string().regex(XLM_AMOUNT_REGEX, XLM_AMOUNT_FORMAT_MESSAGE);
+/** Query strings are coerced first, matching the original budget-range filter behaviour. */
+const XlmAmountQuerySchema = z.coerce.string().regex(XLM_AMOUNT_REGEX, XLM_AMOUNT_FORMAT_MESSAGE);
 
 export const CreateGigSchema = z.object({
   creator: z.string().regex(STELLAR_ADDRESS_REGEX, 'Invalid Stellar address'),
   title: z.string().min(1, 'Title is required').max(200, 'Title must not exceed 200 characters'),
-  budgetXLM: z.string().regex(/^\d+(\.\d{1,7})?$/, 'Invalid XLM amount'),
+  budgetXLM: XlmAmountSchema,
   /** Hours to wait for a response before the sweep marks the gig expired. Defaults to 72. */
   responseWindowHours: z
     .number()
@@ -26,10 +35,7 @@ export type AcceptGigDto = z.infer<typeof AcceptGigSchema>;
 
 export const UpdateGigSchema = z.object({
   title: z.string().min(1).max(200).optional(),
-  budgetXLM: z
-    .string()
-    .regex(/^\d+(\.\d{1,7})?$/, 'Invalid XLM amount')
-    .optional(),
+  budgetXLM: XlmAmountSchema.optional(),
   responseWindowHours: z
     .number()
     .int()
@@ -45,14 +51,8 @@ export const SearchGigsSchema = z.object({
   status: z.nativeEnum(GigStatus).optional(),
   page: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().positive().max(MAX_GIG_SEARCH_LIMIT).optional(),
-  minBudgetXLM: z.coerce
-    .string()
-    .regex(/^\d+(\.\d{1,7})?$/, 'Invalid XLM amount')
-    .optional(),
-  maxBudgetXLM: z.coerce
-    .string()
-    .regex(/^\d+(\.\d{1,7})?$/, 'Invalid XLM amount')
-    .optional(),
+  minBudgetXLM: XlmAmountQuerySchema.optional(),
+  maxBudgetXLM: XlmAmountQuerySchema.optional(),
 });
 
 export type SearchGigsQuery = z.infer<typeof SearchGigsSchema>;

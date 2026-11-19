@@ -29,6 +29,22 @@ const RELEASE_ENTRYPOINT = 'release';
 const RESOURCE_FEE_MARGIN_BASIS_POINTS = 1_100n; // 110% of the simulated minimum
 const BASIS_POINTS = 1_000n;
 
+/**
+ * Hard upper bound on how long any server-built, client-signed transaction may stay valid.
+ *
+ * `config.STELLAR_TX_VALIDITY_SECONDS` is operator-tunable (default 60s), but a misconfigured
+ * or stale deployment must never be able to hand out an effectively unbounded unsigned XDR:
+ * a wallet holding one could submit it days later, long after dispute/deliverable state has
+ * changed. Capping here keeps the timebound short regardless of configuration.
+ */
+export const MAX_RELEASE_TX_VALIDITY_SECONDS = 300;
+
+/** Clamp to [1s, 300s] and normalise fractional/invalid inputs. */
+export function clampReleaseTxValidity(seconds: number): number {
+  if (!Number.isFinite(seconds)) return MAX_RELEASE_TX_VALIDITY_SECONDS;
+  return Math.min(Math.max(Math.floor(seconds), 1), MAX_RELEASE_TX_VALIDITY_SECONDS);
+}
+
 export interface UnsignedReleaseTransaction {
   xdr: string;
   network: string;
@@ -83,7 +99,10 @@ export class EscrowReleaseTransactionBuilderService {
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(operation)
-        .setTimeout(config.STELLAR_TX_VALIDITY_SECONDS);
+        // setTimeout() sets minTime = now and maxTime = now + validity. Capping the
+        // configured value means a held XDR expires quickly instead of remaining
+        // submittable days later, after dispute/deliverable state has changed.
+        .setTimeout(clampReleaseTxValidity(config.STELLAR_TX_VALIDITY_SECONDS));
 
     // Simulate explicitly so the resource fee estimated from the contract invocation is
     // actually used. Relying on the flat BASE_FEE (or on prepareTransaction's implicit

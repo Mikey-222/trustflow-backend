@@ -173,6 +173,97 @@ describe('EscrowService', () => {
         expect(result.total).toBe(0);
         expect(result.data).toHaveLength(0);
       });
+
+      it('excludes cancelled escrows by default but includes them on explicit opt-in', async () => {
+        const live = await service.create('GDEP', BENEFICIARY, '100');
+        const withdrawn = await service.create('GDEP', BENEFICIARY, '200');
+        await service.fund(withdrawn.id);
+        await service.raiseDispute(withdrawn.id);
+        await service.cancel(withdrawn.id);
+
+        const defaultList = await service.findByDepositor('GDEP');
+        expect(defaultList.data.map(e => e.id)).toEqual([live.id]);
+
+        const withCancelled = await service.findByDepositor('GDEP', 0, 20, {
+          includeCancelled: true,
+        });
+        expect(withCancelled.data.map(e => e.id)).toEqual([live.id, withdrawn.id]);
+
+        const cancelledOnly = await service.findByDepositor('GDEP', 0, 20, {
+          status: 'cancelled',
+        });
+        expect(cancelledOnly.data.map(e => e.id)).toEqual([withdrawn.id]);
+      });
+    });
+
+    // ─── changeBeneficiary() ──────────────────────────────────────────────────
+
+    describe('changeBeneficiary()', () => {
+      // Valid StrKey-shaped fixtures (only A-Z and 2-7 after the leading G).
+      const VALID_DEPOSITOR = `G${'A'.repeat(55)}`;
+      const VALID_BENEFICIARY = `G${'B'.repeat(55)}`;
+      const NEW_BENEFICIARY = `G${'C'.repeat(55)}`;
+      const OTHER_ADDRESS = `G${'D'.repeat(55)}`;
+
+      it('changes the beneficiary of a pending escrow for the depositor', async () => {
+        const escrow = await service.create(VALID_DEPOSITOR, VALID_BENEFICIARY, AMOUNT);
+
+        const updated = await service.changeBeneficiary(
+          escrow.id,
+          NEW_BENEFICIARY,
+          VALID_DEPOSITOR,
+        );
+
+        expect(updated.beneficiary).toBe(NEW_BENEFICIARY);
+        expect((await service.findById(escrow.id))?.beneficiary).toBe(NEW_BENEFICIARY);
+      });
+
+      it('refuses to change the beneficiary once the escrow is funded', async () => {
+        const escrow = await service.create(VALID_DEPOSITOR, VALID_BENEFICIARY, AMOUNT);
+        await service.fund(escrow.id);
+
+        await expect(
+          service.changeBeneficiary(escrow.id, NEW_BENEFICIARY, VALID_DEPOSITOR),
+        ).rejects.toThrow('Cannot change the beneficiary of a funded escrow');
+        expect((await service.findById(escrow.id))?.beneficiary).toBe(VALID_BENEFICIARY);
+      });
+
+      it('refuses a requester who is not the depositor', async () => {
+        const escrow = await service.create(VALID_DEPOSITOR, VALID_BENEFICIARY, AMOUNT);
+
+        await expect(
+          service.changeBeneficiary(escrow.id, NEW_BENEFICIARY, OTHER_ADDRESS),
+        ).rejects.toThrow('Only the depositor may change the beneficiary');
+      });
+
+      it('rejects malformed addresses and self-dealing', async () => {
+        const escrow = await service.create(VALID_DEPOSITOR, VALID_BENEFICIARY, AMOUNT);
+
+        await expect(service.changeBeneficiary(escrow.id, 'nope', VALID_DEPOSITOR)).rejects.toThrow(
+          'Invalid Stellar address',
+        );
+        await expect(
+          service.changeBeneficiary(escrow.id, VALID_DEPOSITOR, VALID_DEPOSITOR),
+        ).rejects.toThrow('must not be the same address');
+      });
+
+      it('is a no-op when the beneficiary is unchanged', async () => {
+        const escrow = await service.create(VALID_DEPOSITOR, VALID_BENEFICIARY, AMOUNT);
+
+        const updated = await service.changeBeneficiary(
+          escrow.id,
+          VALID_BENEFICIARY,
+          VALID_DEPOSITOR,
+        );
+
+        expect(updated.beneficiary).toBe(VALID_BENEFICIARY);
+      });
+
+      it('throws NotFoundException for an unknown escrow', async () => {
+        await expect(
+          service.changeBeneficiary('missing', NEW_BENEFICIARY, VALID_DEPOSITOR),
+        ).rejects.toThrow('Escrow not found');
+      });
     });
 
     // ─── fund() ───────────────────────────────────────────────────────────────

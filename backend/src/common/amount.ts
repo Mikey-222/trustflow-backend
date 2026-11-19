@@ -4,6 +4,27 @@ export const STROOPS_PER_XLM = 10_000_000;
 const MAX_DECIMAL_PLACES = 7;
 
 /**
+ * Strict decimal-string format accepted at the API boundary for XLM amounts.
+ *
+ * The fractional part is capped at 7 digits so an amount can always be represented
+ * exactly in stroops (1 XLM = 10,000,000 stroops). Rejecting excess precision here
+ * is deliberate: `normalizeAmount()`/`xlmToStroops()` round down, so a value such as
+ * `100.123456789` accepted at creation would otherwise be silently rounded later —
+ * e.g. when the associated escrow is funded — leaving the displayed budget out of
+ * sync with the amount actually committed on-chain.
+ */
+export const XLM_AMOUNT_REGEX = /^\d+(?:\.\d{1,7})?$/;
+
+/** Shared error message so every endpoint gives clients the same, actionable 400. */
+export const XLM_AMOUNT_FORMAT_MESSAGE =
+  'Amount must be a non-negative decimal string with at most 7 decimal places (Stellar stroop precision)';
+
+/** Type guard for use by DTOs and any other boundary that accepts an amount string. */
+export function isValidXlmAmount(value: unknown): value is string {
+  return typeof value === 'string' && XLM_AMOUNT_REGEX.test(value);
+}
+
+/**
  * Amount handling utilities for XLM amounts carried as decimal strings.
  *
  * All amounts are normalized to decimal strings with up to 7 decimal places.

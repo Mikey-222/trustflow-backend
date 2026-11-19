@@ -32,6 +32,7 @@ function buildMocks() {
     create: jest.fn().mockResolvedValue(escrow),
     findById: jest.fn().mockResolvedValue(escrow),
     findByDepositor: jest.fn().mockResolvedValue([escrow]),
+    changeBeneficiary: jest.fn().mockResolvedValue(escrow),
     release: jest.fn().mockResolvedValue({ ...escrow, status: 'released' }),
   };
 
@@ -108,6 +109,17 @@ describe('EscrowController', () => {
 
       expect(() => controller.create(dto)).toThrow(BadRequestException);
     });
+
+    it('rejects sub-stroop precision in amountXLM instead of rounding it later', () => {
+      const dto = {
+        depositor: DEPOSITOR,
+        beneficiary: BENEFICIARY,
+        amountXLM: '100.123456789',
+      };
+
+      expect(() => controller.create(dto)).toThrow(BadRequestException);
+      expect(mocks.escrowService.create).not.toHaveBeenCalled();
+    });
   });
 
   // ─── GET /escrows/:id (findOne) ───────────────────────────────────────────
@@ -133,14 +145,102 @@ describe('EscrowController', () => {
     it('delegates to EscrowService.findByDepositor() with the address and default pagination', async () => {
       const result = await controller.findByDepositor(DEPOSITOR);
 
-      expect(mocks.escrowService.findByDepositor).toHaveBeenCalledWith(DEPOSITOR, 0, 20);
+      expect(mocks.escrowService.findByDepositor).toHaveBeenCalledWith(DEPOSITOR, 0, 20, {
+        status: undefined,
+        includeCancelled: false,
+      });
       expect(result).toEqual([mocks.escrow]);
+    });
+
+    it('passes a valid status filter through to the service', async () => {
+      await controller.findByDepositor(DEPOSITOR, 0, 20, 'cancelled');
+
+      expect(mocks.escrowService.findByDepositor).toHaveBeenCalledWith(DEPOSITOR, 0, 20, {
+        status: 'cancelled',
+        includeCancelled: false,
+      });
+    });
+
+    it('passes the includeCancelled opt-in through to the service', async () => {
+      await controller.findByDepositor(DEPOSITOR, undefined, undefined, undefined, 'true');
+
+      expect(mocks.escrowService.findByDepositor).toHaveBeenCalledWith(DEPOSITOR, 0, 20, {
+        status: undefined,
+        includeCancelled: true,
+      });
+    });
+
+    it('rejects an unknown status with 400 instead of silently returning everything', () => {
+      expect(() => controller.findByDepositor(DEPOSITOR, 0, 20, 'bogus')).toThrow(
+        'Invalid escrow status',
+      );
+      expect(mocks.escrowService.findByDepositor).not.toHaveBeenCalled();
     });
 
     it('returns an empty array when no escrows exist for the depositor', async () => {
       mocks.escrowService.findByDepositor.mockResolvedValue([]);
 
       expect(await controller.findByDepositor(DEPOSITOR)).toEqual([]);
+    });
+  });
+
+  // ─── PATCH /escrows/:id (sensitive beneficiary update) ─────────────────────
+
+  describe('update()', () => {
+    // Valid StrKey-shaped fixtures (only A-Z and 2-7 after the leading G).
+    const VALID_DEPOSITOR = `G${'A'.repeat(55)}`;
+    const NEW_BENEFICIARY = `G${'C'.repeat(55)}`;
+    const OTHER_ADDRESS = `G${'D'.repeat(55)}`;
+    const req = { user: { address: VALID_DEPOSITOR, sub: VALID_DEPOSITOR } };
+
+    it('delegates a valid beneficiary change to the guarded service method', async () => {
+      mocks.escrowService.findById.mockResolvedValue(
+        makeEscrow({ depositor: VALID_DEPOSITOR, status: 'pending' }),
+      );
+
+      await controller.update('esc-001', { beneficiary: NEW_BENEFICIARY }, req);
+
+      expect(mocks.escrowService.changeBeneficiary).toHaveBeenCalledWith(
+        'esc-001',
+        NEW_BENEFICIARY,
+        VALID_DEPOSITOR,
+      );
+    });
+
+    it('forbids a non-depositor from updating the escrow', async () => {
+      mocks.escrowService.findById.mockResolvedValue(
+        makeEscrow({ depositor: VALID_DEPOSITOR, status: 'pending' }),
+      );
+
+      await expect(
+        controller.update(
+          'esc-001',
+          { beneficiary: NEW_BENEFICIARY },
+          {
+            user: { address: OTHER_ADDRESS, sub: 'x' },
+          },
+        ),
+      ).rejects.toThrow('Only the depositor may update the escrow');
+      expect(mocks.escrowService.changeBeneficiary).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed beneficiary address with 400', async () => {
+      mocks.escrowService.findById.mockResolvedValue(
+        makeEscrow({ depositor: VALID_DEPOSITOR, status: 'pending' }),
+      );
+
+      await expect(
+        controller.update('esc-001', { beneficiary: 'not-an-address' }, req),
+      ).rejects.toThrow('Invalid Stellar address');
+      expect(mocks.escrowService.changeBeneficiary).not.toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException for an unknown escrow', async () => {
+      mocks.escrowService.findById.mockResolvedValue(undefined);
+
+      await expect(
+        controller.update('esc-unknown', { beneficiary: NEW_BENEFICIARY }, req),
+      ).rejects.toThrow(NotFoundException);
     });
   });
 
@@ -164,7 +264,7 @@ describe('EscrowController', () => {
     });
   });
 
-  // ─── POST /escrows/:id/dispute ────────────────────────────────────────────
+  // ─── GET /escrows/:id/release/transaction ────────────────────────────────
 
   describe('buildReleaseTransaction()', () => {
     it('calls the tx builder with contractEscrowId and sourceAccount', async () => {

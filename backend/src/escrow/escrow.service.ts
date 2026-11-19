@@ -109,6 +109,21 @@ export interface BatchApproveResult {
   failed: Array<{ id: string; reason: string }>;
 }
 
+/**
+ * Filter for depositor-facing escrow listings. Mirrors the applicant-list behaviour:
+ * terminal/withdrawn entries are hidden by default and must be explicitly opted into,
+ * so clients that ignore a `status` field can't present them as live candidates.
+ */
+export interface EscrowListFilter {
+  /** Match exactly this status. Takes precedence over `includeCancelled`. */
+  status?: EscrowStatus;
+  /** Include cancelled (withdrawn-equivalent) escrows in the default listing. */
+  includeCancelled?: boolean;
+}
+
+/** Defense-in-depth check; the HTTP layer validates the same format via the DTO. */
+const STELLAR_ADDRESS_REGEX = /^G[A-Z2-7]{55}$/;
+
 @Injectable()
 export class EscrowService implements OnModuleInit {
   private readonly logger = new SanitizedLogger(EscrowService.name);
@@ -207,6 +222,7 @@ export class EscrowService implements OnModuleInit {
     address: string,
     offset = 0,
     limit = 20,
+    filter: EscrowListFilter = {},
   ): Promise<{ data: Escrow[]; total: number }> {
     let all: Escrow[];
     if (this.redis) {
@@ -219,6 +235,14 @@ export class EscrowService implements OnModuleInit {
       }
     } else {
       all = [...this.escrows.values()].filter(e => e.depositor === address);
+    }
+
+    // Cancelled escrows are the equivalent of a withdrawn application: they must not
+    // silently appear alongside live ones. Callers that need them opt in explicitly.
+    if (filter.status !== undefined) {
+      all = all.filter(e => e.status === filter.status);
+    } else if (!filter.includeCancelled) {
+      all = all.filter(e => e.status !== 'cancelled');
     }
 
     const total = all.length;
@@ -289,18 +313,22 @@ export class EscrowService implements OnModuleInit {
    * as an idempotency marker: if the escrow was modified between reading chain state and
    * applying the patch, the write is rejected and the caller can retry with fresh data.
    */
-  async applyChainState(id: string, patch: ChainStatePatch, expectedVersion?: number): Promise<Escrow> {
+  async applyChainState(
+    id: string,
+    patch: ChainStatePatch,
+    expectedVersion?: number,
+  ): Promise<Escrow> {
     const escrow = await this.findById(id);
     if (!escrow) throw new NotFoundException('Escrow not found');
-    
+
     // Optimistic lock check: if caller provides expected version, ensure it matches
     if (expectedVersion !== undefined && escrow.version !== expectedVersion) {
       throw new ConflictException(
         `Escrow version mismatch: expected ${expectedVersion}, found ${escrow.version}. ` +
-        'The escrow was modified concurrently; retry reconciliation with fresh chain state.'
+          'The escrow was modified concurrently; retry reconciliation with fresh chain state.',
       );
     }
-    
+
     if (patch.status !== undefined) {
       if (!ESCROW_STATUSES.includes(patch.status)) {
         throw new BadRequestException(`Invalid escrow status: ${String(patch.status)}`);
@@ -308,7 +336,7 @@ export class EscrowService implements OnModuleInit {
       escrow.status = patch.status;
     }
     if (patch.amountXLM !== undefined) escrow.amountXLM = patch.amountXLM;
-    
+
     // Version is auto-incremented by persist()
     await this.persist(escrow);
     return escrow;
@@ -380,11 +408,63 @@ export class EscrowService implements OnModuleInit {
     return escrow;
   }
 
+  /**
+   * Changes the payout address of an escrow. This is a money-directing operation, so it is
+   * deliberately much more restricted than an ordinary draft-field edit:
+   *
+   * - the requester must be the depositor (checked again here, not only at the HTTP layer);
+   * - once funds are committed (`status !== 'pending'`) the beneficiary is **immutable** —
+   *   changing it would need a fresh signed confirmation from both parties, so it is refused
+   *   outright. This is the "disallow post-funding" option from the issue.
+   *
+   * Every successful change is audit-logged with before/after state.
+   */
+  async changeBeneficiary(id: string, beneficiary: string, requester: string): Promise<Escrow> {
+    const escrow = await this.findById(id);
+    if (!escrow) throw new NotFoundException('Escrow not found');
+
+    if (!STELLAR_ADDRESS_REGEX.test(beneficiary)) {
+      throw new BadRequestException('Invalid Stellar address');
+    }
+    if (escrow.depositor !== requester) {
+      throw new BadRequestException('Only the depositor may change the beneficiary');
+    }
+    if (escrow.status !== 'pending') {
+      throw new BadRequestException(
+        `Cannot change the beneficiary of a funded escrow (status: ${escrow.status})`,
+      );
+    }
+    if (beneficiary === escrow.depositor) {
+      throw new BadRequestException('depositor and beneficiary must not be the same address');
+    }
+    if (beneficiary === escrow.beneficiary) return escrow;
+
+    const beforeState = { ...escrow };
+    escrow.beneficiary = beneficiary;
+    await this.persist(escrow);
+
+    if (this.audit) {
+      await this.audit
+        .logOperation({
+          operation: 'ESCROW_BENEFICIARY_CHANGE',
+          user: requester,
+          entityId: id,
+          entityType: 'escrow',
+          beforeState,
+          afterState: escrow,
+        })
+        .catch(err => this.logger.error('Failed to write audit log', err));
+    }
+
+    return escrow;
+  }
+
   async release(id: string, user: string = 'system'): Promise<Escrow> {
     const escrow = await this.findById(id);
     if (!escrow) throw new NotFoundException('Escrow not found');
     if (escrow.status === 'released') throw new ConflictException('Escrow is already released');
-    if (escrow.status === 'cancelled') throw new ConflictException('Cannot release a cancelled escrow');
+    if (escrow.status === 'cancelled')
+      throw new ConflictException('Cannot release a cancelled escrow');
 
     const beforeState = { ...escrow };
     escrow.status = 'released';
@@ -400,7 +480,12 @@ export class EscrowService implements OnModuleInit {
           beforeState,
           afterState: escrow,
         })
-        .catch((err: unknown) => this.logger.error('Failed to write audit log', err instanceof Error ? err.stack : String(err)));
+        .catch((err: unknown) =>
+          this.logger.error(
+            'Failed to write audit log',
+            err instanceof Error ? err.stack : String(err),
+          ),
+        );
     }
 
     return escrow;
@@ -410,7 +495,8 @@ export class EscrowService implements OnModuleInit {
     const escrow = await this.findById(id);
     if (!escrow) throw new NotFoundException('Escrow not found');
     if (escrow.status === 'cancelled') throw new ConflictException('Escrow is already cancelled');
-    if (escrow.status === 'released') throw new ConflictException('Cannot cancel a released escrow');
+    if (escrow.status === 'released')
+      throw new ConflictException('Cannot cancel a released escrow');
     escrow.status = 'cancelled';
     await this.persist(escrow, ESCROW_EVENTS.ESCROW_CANCELLED);
     return escrow;
@@ -420,7 +506,8 @@ export class EscrowService implements OnModuleInit {
     const escrow = await this.findById(id);
     if (!escrow) throw new NotFoundException('Escrow not found');
     if (escrow.status === 'released') throw new ConflictException('Escrow is already released');
-    if (escrow.status === 'cancelled') throw new ConflictException('Cannot split a cancelled escrow');
+    if (escrow.status === 'cancelled')
+      throw new ConflictException('Cannot split a cancelled escrow');
     escrow.status = 'released';
     escrow.splitPercentage = splitPercentage;
     await this.persist(escrow, ESCROW_EVENTS.ESCROW_SPLIT);
@@ -455,7 +542,12 @@ export class EscrowService implements OnModuleInit {
           beforeState,
           afterState: escrow,
         })
-        .catch((err: unknown) => this.logger.error('Failed to write audit log', err instanceof Error ? err.stack : String(err)));
+        .catch((err: unknown) =>
+          this.logger.error(
+            'Failed to write audit log',
+            err instanceof Error ? err.stack : String(err),
+          ),
+        );
     }
 
     return escrow;
@@ -465,7 +557,7 @@ export class EscrowService implements OnModuleInit {
   private async persist(escrow: Escrow, eventType?: string): Promise<void> {
     // Auto-increment version for optimistic locking on every write
     escrow.version = (escrow.version ?? 0) + 1;
-    
+
     const event = eventType
       ? this.outbox?.create(eventType, 'escrow', escrow.id, escrow)
       : undefined;
@@ -490,8 +582,8 @@ export class EscrowService implements OnModuleInit {
   /**
    * Get milestones for an escrow
    */
-  async getMilestones(escrowId: string): Promise<Milestone[]> {
-    return [...this.milestones.values()].filter(m => m.escrowId === escrowId);
+  getMilestones(escrowId: string): Promise<Milestone[]> {
+    return Promise.resolve([...this.milestones.values()].filter(m => m.escrowId === escrowId));
   }
 
   /**

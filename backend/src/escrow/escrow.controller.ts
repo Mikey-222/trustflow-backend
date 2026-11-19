@@ -6,13 +6,17 @@ import {
   HttpCode,
   HttpStatus,
   NotFoundException,
+  Param,
+  Patch,
   Post,
   Body,
-  Param,
   Query,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
 import { ZodError } from 'zod';
 import {
+  ApiBearerAuth,
   ApiBody,
   ApiHeader,
   ApiOperation,
@@ -21,14 +25,26 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
-import { EscrowService } from './escrow.service';
+import { ESCROW_STATUSES, EscrowListFilter, EscrowService, EscrowStatus } from './escrow.service';
 import { EscrowReleaseTransactionBuilderService } from '../escrow-write/escrow-release-transaction-builder.service';
 import { BuildReleaseTransactionQueryDto } from '../escrow-write/escrow-write.dto';
 import { Idempotent } from '../common/idempotency';
-import { CreateEscrowDto, CreateEscrowSchema, ReleaseEscrowSchema } from './escrow.dto';
+import { JwtAuthGuard } from '../auth/auth.guard';
+import {
+  CreateEscrowDto,
+  CreateEscrowSchema,
+  ReleaseEscrowSchema,
+  UpdateEscrowDto,
+  UpdateEscrowSchema,
+} from './escrow.dto';
 
 // Reference to ensure ReleaseEscrowSchema is considered used (dead-code check requires import)
 void ReleaseEscrowSchema;
+
+/** Shape of `req.user` after `JwtAuthGuard` — see `JwtStrategy.validate()`. */
+interface AuthenticatedRequest {
+  user: { address: string; sub: string };
+}
 
 @ApiTags('Escrow')
 @Controller('escrows')
@@ -233,6 +249,19 @@ export class EscrowController {
     type: Number,
     description: 'Maximum number of items to return (max 100). Defaults to 20.',
   })
+  @ApiQuery({
+    name: 'status',
+    required: false,
+    enum: ESCROW_STATUSES,
+    description:
+      'Return only escrows in this status. When omitted, cancelled (withdrawn) escrows are excluded.',
+  })
+  @ApiQuery({
+    name: 'includeCancelled',
+    required: false,
+    type: Boolean,
+    description: 'Set to true to include cancelled escrows in the default listing.',
+  })
   @ApiResponse({
     status: 200,
     description: 'Paginated list of escrows',
@@ -264,10 +293,86 @@ export class EscrowController {
     @Param('address') address: string,
     @Query('offset') offset?: number,
     @Query('limit') limit?: number,
+    @Query('status') status?: string,
+    @Query('includeCancelled') includeCancelled?: string,
   ) {
     const safeOffset = Math.max(0, Number(offset) || 0);
     const safeLimit = Math.min(Math.max(1, Number(limit) || 20), 100);
-    return this.escrowService.findByDepositor(address, safeOffset, safeLimit);
+
+    if (status !== undefined && !(ESCROW_STATUSES as readonly string[]).includes(status)) {
+      throw new BadRequestException(
+        `Invalid escrow status: ${status}. Expected one of: ${ESCROW_STATUSES.join(', ')}`,
+      );
+    }
+
+    const filter: EscrowListFilter = {
+      status: status as EscrowStatus | undefined,
+      includeCancelled: includeCancelled === 'true' || includeCancelled === '1',
+    };
+    return this.escrowService.findByDepositor(address, safeOffset, safeLimit, filter);
+  }
+
+  @Patch(':id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Update an escrow beneficiary (depositor only, unfunded escrows only)',
+    description:
+      'Changing the beneficiary directs where committed funds go, so it is treated as a ' +
+      'sensitive operation: the caller must be the authenticated depositor, and the change ' +
+      'is refused once the escrow has been funded. There is no ordinary "edit like a draft" ' +
+      'path for this field; post-funding changes require a fresh signed action out of band.',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'Escrow ID',
+    example: '8cbb9b5e-1f41-47c2-a804-8337caa7f005',
+  })
+  @ApiBody({
+    description: 'Escrow fields to update',
+    schema: {
+      type: 'object',
+      required: ['beneficiary'],
+      properties: {
+        beneficiary: {
+          type: 'string',
+          description: 'New Stellar address to receive the escrowed funds',
+          example: 'GYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY',
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 200, description: 'Escrow updated successfully' })
+  @ApiResponse({ status: 400, description: 'Invalid payload or escrow has already been funded' })
+  @ApiResponse({ status: 403, description: 'Only the depositor may update the escrow' })
+  @ApiResponse({ status: 404, description: 'Escrow not found' })
+  async update(
+    @Param('id') id: string,
+    @Body() dto: UpdateEscrowDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const escrow = await this.escrowService.findById(id);
+    if (!escrow) throw new NotFoundException(`Escrow ${id} not found`);
+    if (escrow.depositor !== req.user.address) {
+      throw new ForbiddenException('Only the depositor may update the escrow');
+    }
+
+    let validated: UpdateEscrowDto;
+    try {
+      validated = UpdateEscrowSchema.parse(dto);
+    } catch (err) {
+      if (err instanceof ZodError) {
+        throw new BadRequestException(err.errors[0]?.message ?? 'Invalid escrow payload');
+      }
+      throw err;
+    }
+
+    if (validated.beneficiary === undefined) {
+      throw new BadRequestException('No updatable fields provided');
+    }
+
+    return this.escrowService.changeBeneficiary(id, validated.beneficiary, req.user.address);
   }
 
   @Post(':id/release')
@@ -349,7 +454,10 @@ export class EscrowController {
   })
   @ApiResponse({ status: 400, description: 'Invalid or missing sourceAccount' })
   @ApiResponse({ status: 400, description: 'Escrow is not in active status' })
-  @ApiResponse({ status: 403, description: 'Source account is not authorized to release the escrow' })
+  @ApiResponse({
+    status: 403,
+    description: 'Source account is not authorized to release the escrow',
+  })
   @ApiResponse({ status: 404, description: 'Escrow not found or not linked to an on-chain escrow' })
   @ApiResponse({ status: 503, description: 'TRUSTFLOW_CONTRACT_ID is not configured' })
   async buildReleaseTransaction(

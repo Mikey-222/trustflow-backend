@@ -11,10 +11,39 @@ import {
   amountLessThanOrEqual,
   amountGreaterThan,
   amountGreaterThanOrEqual,
-  STROOPS_PER_XLM,
+  XLM_AMOUNT_FORMAT_MESSAGE,
+  XLM_AMOUNT_REGEX,
+  isValidXlmAmount,
 } from './amount';
 
 describe('Amount Utilities', () => {
+  describe('isValidXlmAmount (API boundary validation)', () => {
+    it('accepts integers and up to 7 decimal places', () => {
+      expect(isValidXlmAmount('100')).toBe(true);
+      expect(isValidXlmAmount('0.0000001')).toBe(true);
+      expect(isValidXlmAmount('100.1234567')).toBe(true);
+    });
+
+    it('rejects sub-stroop precision instead of letting it be rounded away', () => {
+      expect(isValidXlmAmount('100.12345678')).toBe(false);
+      expect(isValidXlmAmount('100.123456789')).toBe(false);
+      expect(XLM_AMOUNT_REGEX.test('100.123456789')).toBe(false);
+    });
+
+    it('rejects negatives, signs, scientific notation and non-strings', () => {
+      expect(isValidXlmAmount('-1')).toBe(false);
+      expect(isValidXlmAmount('+1')).toBe(false);
+      expect(isValidXlmAmount('1e7')).toBe(false);
+      expect(isValidXlmAmount('')).toBe(false);
+      expect(isValidXlmAmount(100 as unknown)).toBe(false);
+    });
+
+    it('exposes an actionable error message naming stroop precision', () => {
+      expect(XLM_AMOUNT_FORMAT_MESSAGE).toContain('7 decimal places');
+      expect(XLM_AMOUNT_FORMAT_MESSAGE).toContain('stroop');
+    });
+  });
+
   describe('parseAmount', () => {
     it('parses valid decimal strings', () => {
       expect(parseAmount('10').toFixed()).toBe('10');
@@ -23,8 +52,8 @@ describe('Amount Utilities', () => {
     });
 
     it('throws on non-string input', () => {
-      expect(() => parseAmount(10 as any)).toThrow('Amount must be a string');
-      expect(() => parseAmount(null as any)).toThrow('Amount must be a string');
+      expect(() => parseAmount(10 as unknown)).toThrow('Amount must be a string');
+      expect(() => parseAmount(null as unknown)).toThrow('Amount must be a string');
     });
 
     it('throws on NaN', () => {
@@ -135,7 +164,8 @@ describe('Amount Utilities', () => {
     });
 
     it('rounds down partial stroops', () => {
-      expect(stroopsToXLM(1.5)).toBe('0.00000001');
+      // 1.5 stroops = 0.00000015 XLM, floored to the 7-decimal stroop grid.
+      expect(stroopsToXLM(1.5)).toBe('0.0000001');
     });
   });
 
@@ -147,7 +177,8 @@ describe('Amount Utilities', () => {
     });
 
     it('rounds down partial stroops', () => {
-      expect(xlmToStroops('0.00000001')).toBe(BigInt(1));
+      // One hundredth of a stroop floors to zero whole stroops.
+      expect(xlmToStroops('0.00000001')).toBe(BigInt(0));
       expect(xlmToStroops('1.0000001')).toBe(BigInt(10_000_001));
     });
 

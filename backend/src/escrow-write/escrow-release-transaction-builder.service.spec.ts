@@ -7,7 +7,11 @@ import {
   rpc as SorobanRpc,
   xdr,
 } from '@stellar/stellar-sdk';
-import { EscrowReleaseTransactionBuilderService } from './escrow-release-transaction-builder.service';
+import {
+  EscrowReleaseTransactionBuilderService,
+  MAX_RELEASE_TX_VALIDITY_SECONDS,
+  clampReleaseTxValidity,
+} from './escrow-release-transaction-builder.service';
 import { validateEnv } from '../config/env.config';
 import { getStellarConfig } from '../stellar/stellar.config';
 
@@ -36,6 +40,22 @@ function makeSimulation(minResourceFee: string): SorobanRpc.Api.SimulateTransact
     result: { auth: [], retval: xdr.ScVal.scvVoid() },
   } as unknown as SorobanRpc.Api.SimulateTransactionResponse;
 }
+
+describe('release transaction validity window', () => {
+  it('keeps the configured default short', () => {
+    expect(clampReleaseTxValidity(60)).toBe(60);
+  });
+
+  it('caps an oversized validity window so held XDRs cannot be replayed days later', () => {
+    expect(clampReleaseTxValidity(60 * 60 * 24)).toBe(MAX_RELEASE_TX_VALIDITY_SECONDS);
+    expect(clampReleaseTxValidity(Number.POSITIVE_INFINITY)).toBe(MAX_RELEASE_TX_VALIDITY_SECONDS);
+  });
+
+  it('never produces a zero or negative validity', () => {
+    expect(clampReleaseTxValidity(0)).toBe(1);
+    expect(clampReleaseTxValidity(-10)).toBe(1);
+  });
+});
 
 describe('EscrowReleaseTransactionBuilderService', () => {
   describe('not configured (no contractId)', () => {
@@ -93,8 +113,8 @@ describe('EscrowReleaseTransactionBuilderService', () => {
       expect(built.operations).toHaveLength(1);
       expect(built.operations[0].type).toBe('invokeHostFunction');
 
-      const { xdr, ...rest } = result;
-      expect(typeof xdr).toBe('string');
+      const { xdr: txXdr, ...rest } = result;
+      expect(typeof txXdr).toBe('string');
       expect(rest).toEqual({
         network: getStellarConfig().network,
         networkPassphrase: getStellarConfig().networkPassphrase,
@@ -138,6 +158,24 @@ describe('EscrowReleaseTransactionBuilderService', () => {
       await expect(service.buildRelease('esc-1', sourceKeypair.publicKey())).rejects.toThrow(
         'Release simulation failed for escrow esc-1: HostError: invalid invocation',
       );
+    });
+
+    it('sets an explicit short maxTime timebound on the unsigned transaction', async () => {
+      const sourceKeypair = Keypair.random();
+      rpcServer.getAccount.mockResolvedValue(new Account(sourceKeypair.publicKey(), '100'));
+      rpcServer.simulateTransaction.mockResolvedValue(makeSimulation('1000'));
+
+      const before = Math.floor(Date.now() / 1000);
+      const result = await service.buildRelease('esc-1', sourceKeypair.publicKey());
+      const after = Math.floor(Date.now() / 1000);
+
+      const built = new Transaction(result.xdr, getStellarConfig().networkPassphrase);
+      const bounds = built.timeBounds;
+      expect(bounds).toBeDefined();
+      expect(Number(bounds!.minTime)).toBe(0);
+      const maxTime = Number(bounds!.maxTime);
+      expect(maxTime).toBeGreaterThanOrEqual(before);
+      expect(maxTime).toBeLessThanOrEqual(after + MAX_RELEASE_TX_VALIDITY_SECONDS);
     });
 
     it('propagates RPC errors instead of swallowing them', async () => {
