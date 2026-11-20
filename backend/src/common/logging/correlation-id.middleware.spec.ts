@@ -106,4 +106,17 @@ describe('CorrelationIdMiddleware', () => {
       });
     });
   });
+  it('redacts sensitive auth/signature request bodies in request_start logs (#916)', done => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const { req, res } = buildReqRes();
+    (req as any).originalUrl = '/auth/verify';
+    (req as any).body = { address: 'G123', signature: 'SUPER_SECRET_SIGNATURE' };
+
+    middleware.use(req, res, () => {
+      expect(logSpy).toHaveBeenCalled();
+      const lastCall = JSON.parse(logSpy.mock.calls[0][0]);
+      expect(lastCall.body).toBe('[REDACTED]');
+      done();
+    });
+  });
 });

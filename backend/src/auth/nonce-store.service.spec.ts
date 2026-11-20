@@ -378,4 +378,22 @@ describe('NonceStoreService', () => {
       expect(await memoryService.consume(TEST_ADDRESS)).toBe(TEST_CHALLENGE);
     });
   });
+  describe('atomic TTL enforcement (#908)', () => {
+    it('executes INCR_WITH_EXPIRE_LUA to set TTL atomically with key increment', async () => {
+      const mockRedis = {
+        eval: jest.fn().mockResolvedValue(1),
+        ttl: jest.fn().mockResolvedValue(60),
+      };
+      const serviceWithRedis = new NonceStoreService(mockRedis as any);
+      const res = await serviceWithRedis.checkWalletChallengeRateLimit('G123', 5, 60);
+
+      expect(res.allowed).toBe(true);
+      expect(mockRedis.eval).toHaveBeenCalledWith(
+        expect.stringContaining('INCR'),
+        1,
+        'auth:challenge:wallet-ratelimit:G123',
+        60,
+      );
+    });
+  });
 });

@@ -26,6 +26,69 @@ import {
  * would otherwise see it. Without this, such errors fell through to a generic 500 even
  * though the error itself already knows its correct status.
  */
+function isDbPoolTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const msg = String((error as any).message ?? '');
+  const code = String((error as any).code ?? '');
+  return (
+    code === '53300' ||
+    /pool exhausted|connection acquisition timeout|timeout exceeded when trying to connect/i.test(msg) ||
+    (error as any).name === 'ConnectionAcquisitionTimeoutError'
+  );
+}
+
+function mapDatabaseError(
+  error: unknown,
+): { status: number; message: string; retryAfter?: number } | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const err = error as Record<string, unknown>;
+
+  // Connection pool exhaustion: return 503 with Retry-After (#917)
+  if (isDbPoolTimeoutError(error)) {
+    return {
+      status: HttpStatus.SERVICE_UNAVAILABLE,
+      message: 'Database connection pool busy. Please retry shortly.',
+      retryAfter: 5,
+    };
+  }
+
+  const code = String(err.code ?? '');
+  if (code === '23505') {
+    return {
+      status: HttpStatus.CONFLICT,
+      message: 'Resource already exists',
+    };
+  }
+  if (code === '23503') {
+    return {
+      status: HttpStatus.BAD_REQUEST,
+      message: 'Referenced resource does not exist',
+    };
+  }
+  if (code === '23502') {
+    return {
+      status: HttpStatus.BAD_REQUEST,
+      message: 'Required field is missing',
+    };
+  }
+  if (code === '22P02') {
+    return {
+      status: HttpStatus.BAD_REQUEST,
+      message: 'Invalid input syntax',
+    };
+  }
+
+  // Any other Postgres / database driver error: do not leak raw SQL error text (#918)
+  if (/^[0-9A-Z]{5}$/.test(code) || err.routine !== undefined || err.severity !== undefined) {
+    return {
+      status: HttpStatus.INTERNAL_SERVER_ERROR,
+      message: 'Database operation failed',
+    };
+  }
+
+  return undefined;
+}
+
 function extractKnownHttpStatus(error: unknown): number | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
   const candidate =
@@ -63,7 +126,14 @@ export class SentryExceptionFilter implements ExceptionFilter {
     // (e.g. per-provider results on a partial failure), forwarded next to the standard ones.
     let details: Record<string, unknown> = {};
 
-    if (exception instanceof HttpException) {
+    const dbMapping = mapDatabaseError(exception);
+    if (dbMapping) {
+      status = dbMapping.status;
+      message = dbMapping.message;
+      if (dbMapping.retryAfter) {
+        response.setHeader('Retry-After', String(dbMapping.retryAfter));
+      }
+    } else if (exception instanceof HttpException) {
       status = exception.getStatus();
       const res = exception.getResponse();
       message =

@@ -214,4 +214,58 @@ describe('SentryExceptionFilter', () => {
     expect(setTag).toHaveBeenCalledWith('correlation_id', requestId);
     expect(withScopeSpy).toHaveBeenCalled();
   });
+  describe('database error handling (#917, #918)', () => {
+    it('returns 503 Service Unavailable with Retry-After on connection pool exhaustion (#917)', () => {
+      const host = buildHost('/test', 'GET');
+      const poolError = new Error('ConnectionAcquisitionTimeoutError: Pool exhausted');
+      (poolError as any).name = 'ConnectionAcquisitionTimeoutError';
+
+      filter.catch(poolError, host);
+
+      expect(host.response.status).toHaveBeenCalledWith(HttpStatus.SERVICE_UNAVAILABLE);
+      expect(host.response.setHeader).toHaveBeenCalledWith('Retry-After', '5');
+      expect(host.response.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+          message: 'Database connection pool busy. Please retry shortly.',
+        }),
+      );
+    });
+
+    it('maps unique constraint violation 23505 to 409 Conflict without leaking SQL internals (#918)', () => {
+      const host = buildHost('/test', 'POST');
+      const sqlError = new Error(
+        'duplicate key value violates unique constraint "ratings_deliverable_id_rater_wallet_key"',
+      );
+      (sqlError as any).code = '23505';
+      (sqlError as any).table = 'ratings';
+      (sqlError as any).constraint = 'ratings_deliverable_id_rater_wallet_key';
+
+      filter.catch(sqlError, host);
+
+      expect(host.response.status).toHaveBeenCalledWith(HttpStatus.CONFLICT);
+      expect(host.response.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: HttpStatus.CONFLICT,
+          message: 'Resource already exists',
+        }),
+      );
+    });
+
+    it('sanitizes generic unhandled Postgres driver errors without leaking raw SQL details (#918)', () => {
+      const host = buildHost('/test', 'POST');
+      const sqlError = new Error('syntax error at or near "SELECT * FROM secret_table"');
+      (sqlError as any).code = '42601';
+
+      filter.catch(sqlError, host);
+
+      expect(host.response.status).toHaveBeenCalledWith(HttpStatus.INTERNAL_SERVER_ERROR);
+      expect(host.response.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+          message: 'Database operation failed',
+        }),
+      );
+    });
+  });
 });

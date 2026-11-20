@@ -49,6 +49,8 @@ export interface MigrationRun {
   completedAt?: string;
   failedAt?: string;
   rollbackReason?: string;
+  auditNote?: string;
+  adminAddress?: string;
 }
 
 /** Result of processing a single bounded backfill batch. */
@@ -80,6 +82,14 @@ export abstract class SchemaMigration {
   abstract readonly description: string;
 
   abstract expand(): Promise<void>;
+
+  /**
+   * Optional: the raw DDL statement(s) `contract()` will execute, declared purely so the
+   * runner can flag destructive operations (DROP COLUMN/TABLE, TRUNCATE) before running them
+   * and require an explicit `force` option (#971). This is advisory metadata only — the
+   * runner never executes these statements itself, `contract()` still does the real work.
+   */
+  plannedContractSql?(): string[];
 
   /** Rows still needing backfill, counted once before the backfill phase starts. */
   abstract countPending(): Promise<number>;

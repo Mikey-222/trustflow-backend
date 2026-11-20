@@ -20,6 +20,14 @@ end
 return val
 `;
 
+const INCR_WITH_EXPIRE_LUA = `
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return current
+`;
+
 @Injectable()
 export class NonceStoreService {
   private readonly logger = new SanitizedLogger(NonceStoreService.name);
@@ -210,10 +218,9 @@ export class NonceStoreService {
 
     if (this.redis) {
       try {
-        const count = await this.redis.incr(key);
-        if (count === 1) {
-          await this.redis.expire(key, durationSeconds);
-        }
+        const count = Number(
+          await this.redis.eval(INCR_WITH_EXPIRE_LUA, 1, key, durationSeconds),
+        );
         if (count > points) {
           const ttl = await this.redis.ttl(key);
           return { allowed: false, retryAfter: ttl > 0 ? ttl : durationSeconds };

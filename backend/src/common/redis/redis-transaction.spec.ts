@@ -2,6 +2,7 @@ import {
   assertTransactionApplied,
   isTransactionIntegrityError,
   RedisTransactionError,
+  execWithTimeout,
 } from './redis-transaction';
 
 describe('redis-transaction', () => {
@@ -91,6 +92,24 @@ describe('redis-transaction', () => {
       // would have silently disabled the safety check.
       const error = new Error('Redis transaction aborted (exec() returned null)');
       expect(isTransactionIntegrityError(error)).toBe(false);
+    });
+  });
+  describe('execWithTimeout (#907)', () => {
+    it('resolves when exec completes before timeout', async () => {
+      const fakeBatch = {
+        exec: jest.fn().mockResolvedValue([['OK', 1]]),
+      };
+      const result = await execWithTimeout(fakeBatch, 500);
+      expect(result).toEqual([['OK', 1]]);
+    });
+
+    it('rejects with timeout error when exec exceeds timeout', async () => {
+      const slowBatch = {
+        exec: jest.fn(() => new Promise(resolve => setTimeout(resolve, 200))),
+      };
+      await expect(execWithTimeout(slowBatch, 50)).rejects.toThrow(
+        'Redis transaction/pipeline timed out after 50ms',
+      );
     });
   });
 });

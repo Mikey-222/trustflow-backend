@@ -70,10 +70,15 @@ export class IdempotencyKeyInterceptor implements NestInterceptor {
 
     if (!idempotencyKey) return next.handle();
 
-    const scope = request.user?.sub ?? request.ip ?? 'anonymous';
+    const caller =
+      request.user?.address ??
+      request.user?.sub ??
+      request.headers?.['x-wallet-address'] ??
+      request.ip ??
+      'anonymous';
     const routePath = `${request.method}:${request.route?.path ?? request.url}`;
-    const endpoint = `${scope}:${routePath}`;
-    const requestHash = IdempotencyKeyService.hashBody(request.body);
+    const endpoint = `${caller}:${routePath}`;
+    const requestHash = IdempotencyKeyService.hashBody(request.body, caller);
 
     const claimResult = await this.idempotencyService.claim(endpoint, idempotencyKey, requestHash);
 
@@ -119,14 +124,18 @@ export class IdempotencyKeyInterceptor implements NestInterceptor {
     return next.handle().pipe(
       concatMap(async (responseBody: unknown) => {
         const response = context.switchToHttp().getResponse();
-        if (response.statusCode >= 400) {
+        const statusCode =
+          (responseBody as any)?.statusCode ?? response?.statusCode ?? HttpStatus.OK;
+        const isSuccess = statusCode >= 200 && statusCode < 300;
+        if (!isSuccess) {
+          // Never cache 4xx client errors or non-2xx failures under the idempotency key (#911)
           await this.idempotencyService.release(endpoint, idempotencyKey);
         } else {
           await this.idempotencyService.finalize(
             endpoint,
             idempotencyKey,
             requestHash,
-            response.statusCode,
+            statusCode,
             responseBody,
             this.capturedHeaders(response),
           );

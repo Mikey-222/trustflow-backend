@@ -1,5 +1,7 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
+import { CorrelationIdStore } from '../common/logging/correlation-id.store';
+import { requestContextStorage } from '../common/logging/request-context';
 import { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../common/redis/redis.module';
 import { MetricsService } from '../monitoring/metrics.service';
@@ -63,7 +65,11 @@ export class OutboxService {
   // ── In-memory fallback (used when Redis is null) ──
   private readonly memory = new Map<string, OutboxEvent>();
   private readonly pending = new Set<string>();
-  private readonly processing = new Set<string>();
+  // Maps a claimed event id to its lease expiry (ms epoch), mirroring the Redis path's
+  // `outbox:processing` sorted-set score. Without this, a consumer that claims a batch and
+  // then crashes before dispatching leaves those ids with no recorded expiry at all, so
+  // nothing can ever tell a crashed claim apart from one that's still being worked — see #976.
+  private readonly processing = new Map<string, number>();
 
   // ── Legacy in-memory store (for createEvent/processEvent/replayEvent) ──
   private readonly legacyEvents = new Map<string, LegacyOutboxEvent>();
@@ -72,6 +78,7 @@ export class OutboxService {
   constructor(
     @Optional() @Inject(REDIS_CLIENT) private readonly redis: Redis | null = null,
     @Optional() private readonly metrics?: MetricsService,
+    @Optional() private readonly correlationIdStore?: CorrelationIdStore,
   ) {}
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -82,7 +89,18 @@ export class OutboxService {
    * Builds a new OutboxEvent but does NOT persist it yet — callers must follow
    * up with `append()` or `appendToTransaction()`.
    */
-  create(type: string, aggregateType: string, aggregateId: string, payload: unknown): OutboxEvent {
+  create(
+    type: string,
+    aggregateType: string,
+    aggregateId: string,
+    payload: unknown,
+    correlationId?: string,
+  ): OutboxEvent {
+    const resolvedCorrelationId =
+      correlationId ??
+      this.correlationIdStore?.get() ??
+      requestContextStorage.getStore()?.requestId;
+
     return {
       id: randomUUID(),
       dedupKey: `${type}:${aggregateType}:${aggregateId}:${Date.now()}`,
@@ -94,6 +112,7 @@ export class OutboxService {
       attempts: 0,
       nextAttemptAt: Date.now(),
       createdAt: new Date().toISOString(),
+      correlationId: resolvedCorrelationId,
     };
   }
 
@@ -158,7 +177,7 @@ export class OutboxService {
       const event = this.memory.get(id);
       if (event && event.nextAttemptAt <= now) {
         this.pending.delete(id);
-        this.processing.add(id);
+        this.processing.set(id, now + leaseMs);
         claimed.push(event);
       }
     }
@@ -185,10 +204,15 @@ export class OutboxService {
       )) as string[];
     }
 
-    // In-memory fallback: all processing items are "expired" immediately
+    // In-memory fallback: only reclaim ids whose recorded lease has actually passed,
+    // mirroring RECLAIM_EXPIRED_SCRIPT's `ZRANGEBYSCORE ... '-inf' now` on the Redis path.
+    // A claim still inside its lease window belongs to a consumer that may still be
+    // (legitimately) mid-dispatch, not a crashed one — reclaiming it early would let two
+    // consumers process the same event concurrently, defeating the point of the lease.
     const reclaimed: string[] = [];
-    for (const id of this.processing) {
+    for (const [id, leaseExpiresAt] of this.processing) {
       if (reclaimed.length >= batchSize) break;
+      if (leaseExpiresAt > now) continue;
       this.processing.delete(id);
       this.pending.add(id);
       reclaimed.push(id);
@@ -209,12 +233,14 @@ export class OutboxService {
 
     if (this.redis) {
       const ttl = config.OUTBOX_DELIVERED_TTL_SECONDS;
-      const tx = this.redis
-        .multi()
-        .set(this.eventKey(event.id), JSON.stringify(updated))
-        .zrem(PROCESSING_KEY, event.id)
+      const tx = this.redis.multi();
+      if (ttl > 0) {
+        tx.set(this.eventKey(event.id), JSON.stringify(updated), 'EX', ttl);
+      } else {
+        tx.set(this.eventKey(event.id), JSON.stringify(updated));
+      }
+      tx.zrem(PROCESSING_KEY, event.id)
         .zrem(PENDING_KEY, event.id);
-      if (ttl > 0) tx.expire(this.eventKey(event.id), ttl);
       const results = await tx.exec();
       this.assertTransactionOk(results);
       return;

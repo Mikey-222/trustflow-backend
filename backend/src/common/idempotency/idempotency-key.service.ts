@@ -8,6 +8,7 @@ import { config } from '../../config/env.config';
 
 const KEY_PREFIX = 'idempotency:';
 const RECORD_VERSION = 1;
+const DEFAULT_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60; // 24 hours (#910)
 export interface IdempotencyRecord {
   /** Schema version of this record, so future format changes can be handled gracefully. */
   version: number;
@@ -38,10 +39,12 @@ export class IdempotencyKeyService {
    * Hashes a request body to a stable fingerprint. We hash rather than store
    * the raw body so the Redis key stays compact.
    */
-  static hashBody(body: unknown): string {
-    return createHash('sha256')
-      .update(JSON.stringify(body ?? {}))
-      .digest('hex');
+  static hashBody(body: unknown, caller?: string): string {
+    const hash = createHash('sha256').update(JSON.stringify(body ?? {}));
+    if (caller) {
+      hash.update(`:caller:${caller}`);
+    }
+    return hash.digest('hex');
   }
 
   /**
@@ -60,7 +63,7 @@ export class IdempotencyKeyService {
     endpoint: string,
     key: string,
     requestHash: string,
-    ttlSeconds: number = config.IDEMPOTENCY_KEY_TTL_SECONDS,
+    ttlSeconds: number = config.IDEMPOTENCY_KEY_TTL_SECONDS ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS,
   ): Promise<ClaimResult> {
     if (!this.redis) return { claimed: true };
 
@@ -110,7 +113,7 @@ export class IdempotencyKeyService {
     statusCode: number,
     body: unknown,
     headers: Record<string, string> = {},
-    ttlSeconds: number = config.IDEMPOTENCY_KEY_TTL_SECONDS,
+    ttlSeconds: number = config.IDEMPOTENCY_KEY_TTL_SECONDS ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS,
   ): Promise<void> {
     if (!this.redis) return;
     const record: IdempotencyRecord = {

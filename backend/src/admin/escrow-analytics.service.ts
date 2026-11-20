@@ -86,63 +86,95 @@ export class EscrowAnalyticsService {
     const redisTotalValue = await this.redis?.get('escrow:total_value_xlm');
     const totalValueXLM = redisTotalValue ?? '0';
 
-    // Cursor-based pagination using Redis ZSET
+    // Parse compound cursor: (createdAtScore, id) to prevent pagination gaps & duplicates (#912)
+    let cursorScore: number | undefined;
+    let cursorId: string | undefined;
+    if (cursor) {
+      const parts = cursor.split(':');
+      if (parts.length >= 2) {
+        cursorScore = parseFloat(parts[0]);
+        cursorId = parts.slice(1).join(':');
+      } else {
+        cursorScore = parseFloat(cursor);
+      }
+    }
+
     let rawItems: any[] = [];
     let newCursor: string | null = null;
     let hasMore = false;
 
     if (this.redis) {
-      // Use ZRANGEBYSCORE with LIMIT for efficient pagination
-      // The ZSET ESCROWS_INDEX_KEY uses createdAt timestamps as scores
-      const scoreMin = cursor ? parseFloat(cursor.split(':')[0]) : undefined;
-
-      const rangeLimit = effectiveLimit + 1; // Get one extra to determine hasMore
-      const rangeResults = await this.redis!.zrangebyscore(
+      const scoreMin = cursorScore !== undefined ? cursorScore : '-inf';
+      const rangeLimit = effectiveLimit * 2 + 1; // Fetch buffer to allow compound filtering
+      const rangeResults = await this.redis.zrangebyscore(
         'escrows:index',
-        scoreMin ?? '-inf',
+        scoreMin,
         '+inf',
         'LIMIT',
         0,
         rangeLimit,
       );
 
-      if (rangeResults.length > 0) {
-        // If we got more than effectiveLimit results, there are more pages
-        hasMore = rangeResults.length > effectiveLimit;
-        const actualLimit = hasMore ? effectiveLimit : rangeResults.length;
-        const idsToFetch = rangeResults.slice(0, actualLimit);
-
-        // Fetch escrow entities by ID using mget
-        if (idsToFetch.length > 0 && this.escrowService) {
-          // Use the service's internal Redis to fetch by key
-          const escrowKeys = idsToFetch.map(id => `escrow:${id}`);
-          const raw = await this.escrowService['redis']!.mget(...escrowKeys);
-          rawItems = raw.filter((r): r is string => r !== null).map(r => JSON.parse(r));
-        } else if (idsToFetch.length > 0) {
-          // Fallback: construct minimal objects from IDs
-          rawItems = idsToFetch.map((id: string) => ({ id, status: 'pending' }));
+      // Filter with compound cursor (createdAt, id)
+      let filteredIds: string[] = [];
+      if (cursorScore !== undefined && cursorId !== undefined) {
+        for (const id of rangeResults) {
+          const score = await this.redis.zscore('escrows:index', id);
+          const numScore = score !== null ? parseFloat(score) : 0;
+          if (numScore > cursorScore || (numScore === cursorScore && id > cursorId)) {
+            filteredIds.push(id);
+          }
         }
+      } else {
+        filteredIds = rangeResults;
       }
 
-      // Determine the next cursor
-      if (rangeResults.length > 0) {
-        const lastId = rangeResults[rangeResults.length - 1];
-        const lastScore = await this.redis!.zscore('escrows:index', lastId);
+      hasMore = filteredIds.length > effectiveLimit;
+      const actualLimit = hasMore ? effectiveLimit : filteredIds.length;
+      const idsToFetch = filteredIds.slice(0, actualLimit);
+
+      if (idsToFetch.length > 0 && this.escrowService) {
+        const escrowKeys = idsToFetch.map(id => `escrow:${id}`);
+        const raw = await this.escrowService['redis']!.mget(...escrowKeys);
+        rawItems = raw.filter((r): r is string => r !== null).map(r => JSON.parse(r));
+      } else if (idsToFetch.length > 0) {
+        rawItems = idsToFetch.map((id: string) => ({ id, status: 'pending' }));
+      }
+
+      if (idsToFetch.length > 0) {
+        const lastId = idsToFetch[idsToFetch.length - 1];
+        const lastScore = await this.redis.zscore('escrows:index', lastId);
         if (lastScore !== null) {
           newCursor = `${lastScore}:${lastId}`;
         }
       }
     } else {
-      // Fallback without Redis - use escrowService with pagination
+      // Fallback without Redis - deterministic compound sorting by (createdAt, id) (#912)
       if (this.escrowService) {
-        const result = await this.escrowService.findAll();
-        rawItems = result;
-        hasMore = result.length > effectiveLimit;
+        let allEscrows = await this.escrowService.findAll();
+        allEscrows.sort((a, b) => {
+          const timeA = new Date(a.createdAt).getTime();
+          const timeB = new Date(b.createdAt).getTime();
+          if (timeA !== timeB) return timeA - timeB;
+          return a.id.localeCompare(b.id);
+        });
 
-        // Simple cursor: just the last timestamp
-        if (rawItems.length > 0 && hasMore) {
-          const lastItem = rawItems[effectiveLimit - 1];
-          newCursor = lastItem.createdAt?.toISOString() || String(lastItem.createdAt);
+        if (cursorScore !== undefined && cursorId !== undefined) {
+          allEscrows = allEscrows.filter(item => {
+            const itemTime = new Date(item.createdAt).getTime();
+            if (itemTime > cursorScore!) return true;
+            if (itemTime === cursorScore! && item.id > cursorId!) return true;
+            return false;
+          });
+        }
+
+        hasMore = allEscrows.length > effectiveLimit;
+        rawItems = allEscrows.slice(0, effectiveLimit);
+
+        if (rawItems.length > 0) {
+          const lastItem = rawItems[rawItems.length - 1];
+          const lastScore = new Date(lastItem.createdAt).getTime();
+          newCursor = `${lastScore}:${lastItem.id}`;
         }
       }
     }

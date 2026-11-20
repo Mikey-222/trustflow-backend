@@ -68,16 +68,18 @@ export class MigrationStateStore implements OnModuleInit {
 
     if (this.redis) {
       try {
-        const multi = this.redis
-          .multi()
-          .set(this.runKey(run.runId), JSON.stringify(run))
-          .sadd(RUNS_INDEX_KEY, run.runId);
+        const ttlSeconds = this.isTerminalState(run.status)
+          ? config.MIGRATION_RUN_TTL_SECONDS
+          : undefined;
 
-        // Set TTL for terminal states (COMPLETED, ROLLED_BACK, FAILED)
-        if (this.isTerminalState(run.status)) {
-          const ttlSeconds = config.MIGRATION_RUN_TTL_SECONDS;
-          multi.expire(this.runKey(run.runId), ttlSeconds);
+        const multi = this.redis.multi();
+        // Atomically set key with TTL for terminal states (#908)
+        if (ttlSeconds && ttlSeconds > 0) {
+          multi.set(this.runKey(run.runId), JSON.stringify(run), 'EX', ttlSeconds);
+        } else {
+          multi.set(this.runKey(run.runId), JSON.stringify(run));
         }
+        multi.sadd(RUNS_INDEX_KEY, run.runId);
 
         const results = await multi.exec();
         this.assertTransactionOk(results);

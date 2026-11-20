@@ -376,4 +376,30 @@ describe('IdempotencyKeyService', () => {
       await expect(service.release('endpoint', 'key')).resolves.toBeUndefined();
     });
   });
+  describe('caller scoping and validation retry (#909, #911)', () => {
+    it('scopes idempotency key per authenticated user wallet address (#909)', async () => {
+      const mockRedis = createRedisMock();
+      const service = new IdempotencyKeyService(mockRedis as any);
+      const hash1 = IdempotencyKeyService.hashBody({ amount: 100 }, 'GWALLET1');
+      const hash2 = IdempotencyKeyService.hashBody({ amount: 100 }, 'GWALLET2');
+
+      expect(hash1).not.toBe(hash2);
+      await service.claim('GWALLET1:POST:/escrows', 'key-1', hash1);
+      const secondUserClaim = await service.claim('GWALLET2:POST:/escrows', 'key-1', hash2);
+      expect(secondUserClaim.claimed).toBe(true);
+    });
+
+    it('releases key on error without caching 4xx response (#911)', async () => {
+      const mockRedis = createRedisMock();
+      const service = new IdempotencyKeyService(mockRedis as any);
+      await service.claim('user1:POST:/gigs', 'key-error', 'hash-bad');
+
+      // Release upon error/validation failure
+      await service.release('user1:POST:/gigs', 'key-error');
+
+      // Retrying with fixed request wins a fresh claim
+      const retryClaim = await service.claim('user1:POST:/gigs', 'key-error', 'hash-good');
+      expect(retryClaim.claimed).toBe(true);
+    });
+  });
 });

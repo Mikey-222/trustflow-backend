@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsInt, IsOptional, Min, Max } from 'class-validator';
+import { IsBoolean, IsInt, IsNotEmpty, IsOptional, IsString, Min, Max } from 'class-validator';
 import { Type } from 'class-transformer';
 import {
   BackfillProgress,
@@ -46,6 +46,17 @@ export class RunMigrationDto {
   @IsOptional()
   @IsBoolean()
   dryRun?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Required to proceed when the migration declares a destructive contract-phase operation ' +
+      '(DROP COLUMN/TABLE, TRUNCATE). Ignored for dryRun, which only previews the migration.',
+    example: false,
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  force?: boolean;
 }
 
 export class BackfillProgressDto implements BackfillProgress {
@@ -67,6 +78,23 @@ export class MigrationStepRecordDto implements MigrationStepRecord {
   @ApiPropertyOptional() error?: string;
 }
 
+export class MarkMigrationAppliedDto {
+  @ApiProperty({
+    description: 'Mandatory justification / audit note explaining why this migration was applied out-of-band',
+    example: 'Applied manually via psql console during incident INC-1234',
+  })
+  @IsString()
+  @IsNotEmpty({ message: 'Audit note / reason is required' })
+  reason!: string;
+
+  @ApiPropertyOptional({
+    description: 'Alternative field for justification / audit note',
+  })
+  @IsOptional()
+  @IsString()
+  justification?: string;
+}
+
 export class MigrationRunResponseDto {
   @ApiProperty() runId!: string;
   @ApiProperty() migrationName!: string;
@@ -80,6 +108,10 @@ export class MigrationRunResponseDto {
   @ApiPropertyOptional() completedAt?: string;
   @ApiPropertyOptional() failedAt?: string;
   @ApiPropertyOptional() rollbackReason?: string;
+  @ApiPropertyOptional({
+    description: 'Audit note provided when a migration is marked applied manually',
+  })
+  auditNote?: string;
 }
 
 export class MigrationDefinitionResponseDto {

@@ -76,6 +76,8 @@ cd backend
 cp ../.env.example .env
 ```
 
+> **Note on .env Precedence (#920)**: `backend/.env` is the primary source of truth for the backend service. If both a root `.env` and `backend/.env` exist, `backend/.env` takes precedence. Pre-existing environment variables already set in your shell/container always take highest precedence over file values.
+
 Key variables:
 
 ```env
@@ -92,6 +94,8 @@ REDIS_COMMAND_TIMEOUT_MS=1000
 ```
 
 See [`.env.example`](.env.example) for the full list of variables, including optional IPFS, database, and admin settings.
+
+Configuration (including toggle/feature-flag-style variables) is validated once at startup and held as an immutable snapshot. Changing an environment variable in a running deployment has **no effect until every instance is restarted** — see [Configuration and feature flags](docs/configuration.md) for details and for the live-reload option.
 
 **What dependencies are required?** See [Runtime Dependencies](docs/runtime-dependencies.md) for a detailed breakdown of each external service (Redis, PostgreSQL, Stellar, IPFS, etc.), what happens when they're unset or down, and which are mandatory for production.
 

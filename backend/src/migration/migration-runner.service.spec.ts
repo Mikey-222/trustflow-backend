@@ -200,4 +200,128 @@ describe('MigrationRunnerService', () => {
   it('throws NotFoundException for an unknown run id', async () => {
     await expect(runner.findById('mig-unknown')).rejects.toThrow(NotFoundException);
   });
+
+  describe('markApplied', () => {
+    it('creates a completed migration run with mandatory audit note', async () => {
+      const run = await runner.markApplied(fake.name, {
+        reason: 'Applied manually via DB console during outage recovery',
+      });
+
+      expect(run.status).toBe(MigrationStatus.COMPLETED);
+      expect(run.migrationName).toBe(fake.name);
+      expect(run.auditNote).toBe('Applied manually via DB console during outage recovery');
+      expect(run.stepHistory).toHaveLength(3);
+
+      const retrieved = await runner.findById(run.runId);
+      expect(retrieved.status).toBe(MigrationStatus.COMPLETED);
+      expect(retrieved.auditNote).toBe('Applied manually via DB console during outage recovery');
+    });
+
+    it('rejects when audit note is missing or empty', async () => {
+      await expect(
+        runner.markApplied(fake.name, { reason: '   ' }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects when migration is not registered', async () => {
+      await expect(
+        runner.markApplied('unregistered-migration', { reason: 'Recovery' }),
+      ).rejects.toThrow(NotFoundException);
+    });
+  });
+  describe('admin audit logging (#905)', () => {
+    it('records acting admin wallet in audit log on migration run and rollback', async () => {
+      const mockAudit = { logOperation: jest.fn().mockResolvedValue(undefined) };
+      const auditModule: TestingModule = await Test.createTestingModule({
+        providers: [
+          MigrationRunnerService,
+          MigrationRegistryService,
+          MigrationStateStore,
+          { provide: MIGRATION_DEFINITIONS, useValue: [fake] },
+          { provide: 'AuditService', useValue: mockAudit },
+        ],
+      })
+        .useMocker(token => {
+          if (token === 'AuditService' || (token as any)?.name === 'AuditService') return mockAudit;
+        })
+        .compile();
+
+      const auditRunner = auditModule.get<MigrationRunnerService>(MigrationRunnerService);
+      (auditRunner as any).audit = mockAudit;
+
+      const run = await auditRunner.run('fake-migration', {}, 'GADMIN_TEST_WALLET');
+      expect(run.adminAddress).toBe('GADMIN_TEST_WALLET');
+      expect(mockAudit.logOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: 'MIGRATION_RUN',
+          user: 'GADMIN_TEST_WALLET',
+          entityId: run.runId,
+          entityType: 'migration',
+        }),
+      );
+
+      await auditRunner.rollback(run.runId, 'GADMIN_TEST_WALLET');
+      expect(mockAudit.logOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: 'MIGRATION_ROLLBACK',
+          user: 'GADMIN_TEST_WALLET',
+          entityId: run.runId,
+          entityType: 'migration',
+        }),
+      );
+    });
+  });
+
+  describe('destructive contract-phase operations (#971)', () => {
+    class DestructiveMigration extends FakeMigration {
+      readonly name = 'destructive-migration';
+
+      plannedContractSql(): string[] {
+        return [`ALTER TABLE ${this.targetTable} DROP COLUMN legacy_flag`];
+      }
+    }
+
+    let destructive: DestructiveMigration;
+    let destructiveRunner: MigrationRunnerService;
+
+    beforeEach(async () => {
+      destructive = new DestructiveMigration();
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          MigrationRunnerService,
+          MigrationRegistryService,
+          MigrationStateStore,
+          { provide: MIGRATION_DEFINITIONS, useValue: [destructive] },
+        ],
+      }).compile();
+
+      destructiveRunner = module.get<MigrationRunnerService>(MigrationRunnerService);
+    });
+
+    it('rejects a real run without force when the migration declares a DROP COLUMN', async () => {
+      await expect(destructiveRunner.run(destructive.name, { batchSize: 4 })).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(destructive.expandCalls).toBe(0);
+    });
+
+    it('proceeds when force: true is passed', async () => {
+      const run = await destructiveRunner.run(destructive.name, { batchSize: 4, force: true });
+      expect(run.status).toBe(MigrationStatus.COMPLETED);
+      expect(destructive.contractCalls).toBe(1);
+    });
+
+    it('allows a dry run to preview without requiring force', async () => {
+      const run = await destructiveRunner.run(destructive.name, { dryRun: true });
+      expect(run.status).toBe(MigrationStatus.COMPLETED);
+      expect(destructive.expandCalls).toBe(0);
+    });
+
+    it('does not gate a migration that declares no planned SQL', async () => {
+      // `fake` (outer describe's FakeMigration) never overrides plannedContractSql.
+      const run = await runner.run(fake.name, { batchSize: 4 });
+      expect(run.status).toBe(MigrationStatus.COMPLETED);
+    });
+  });
 });

@@ -1,3 +1,29 @@
+import { config } from '../../config/env.config';
+
+/**
+ * Wraps execution of a multi/pipeline batch in a timeout bound by REDIS_COMMAND_TIMEOUT_MS
+ * (or explicit timeoutMs), preventing slow batch responses from exceeding command deadlines (#907).
+ */
+export async function execWithTimeout<T = ExecResults>(
+  pipelineOrMulti: { exec: () => Promise<T> },
+  timeoutMs: number = config.REDIS_COMMAND_TIMEOUT_MS,
+): Promise<T> {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return pipelineOrMulti.exec();
+  }
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Redis transaction/pipeline timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([pipelineOrMulti.exec(), timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 /**
  * Shared Redis transaction-integrity helpers.
  *

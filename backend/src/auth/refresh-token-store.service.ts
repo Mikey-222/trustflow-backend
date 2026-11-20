@@ -105,6 +105,7 @@ export class RefreshTokenStoreService {
             REFRESH_TOKEN_TTL_SECONDS,
           )
           .sadd(familyKey, newToken)
+          .expire(familyKey, REFRESH_TOKEN_TTL_SECONDS)
           .exec();
 
         return { valid: true, newToken };

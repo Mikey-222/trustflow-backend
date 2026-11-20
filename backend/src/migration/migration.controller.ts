@@ -4,15 +4,18 @@ import {
   Post,
   Param,
   Body,
+  Req,
   UseGuards,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
+import { AuthenticatedRequest } from '../auth/auth.types';
 import { ApiTags, ApiOperation, ApiParam, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { MigrationRunnerService } from './migration-runner.service';
 import { MigrationRegistryService } from './migration-registry.service';
 import {
   RunMigrationDto,
+  MarkMigrationAppliedDto,
   MigrationRunResponseDto,
   MigrationDefinitionResponseDto,
 } from './migration.dto';
@@ -61,15 +64,25 @@ export class MigrationController {
     summary: 'Execute an expand → backfill → contract migration',
     description:
       'Runs the named migration end to end in small batches so the target table is never locked. ' +
-      'If any phase fails, compensating actions automatically roll back the expand/contract changes.',
+      'If any phase fails, compensating actions automatically roll back the expand/contract changes. ' +
+      'A migration whose contract phase declares a destructive operation (DROP COLUMN/TABLE, ' +
+      'TRUNCATE) is rejected unless `force: true` is set.',
   })
   @ApiParam({ name: 'name', example: 'gigs-add-priority-column' })
   @ApiResponse({ status: 201, type: MigrationRunResponseDto })
+  @ApiResponse({
+    status: 400,
+    description: 'Migration declares a destructive contract-phase operation and force was not set',
+  })
   @ApiResponse({ status: 403, description: 'Caller is authenticated but not an admin address' })
   @ApiResponse({ status: 404, description: 'Migration not registered' })
   @ApiResponse({ status: 409, description: 'Migration already has an active run' })
-  run(@Param('name') name: string, @Body() dto: RunMigrationDto) {
-    return this.runner.run(name, dto);
+  run(
+    @Param('name') name: string,
+    @Body() dto: RunMigrationDto,
+    @Req() req?: AuthenticatedRequest,
+  ) {
+    return this.runner.run(name, dto, req?.user?.address);
   }
 
   @Post('runs/:runId/rollback')
@@ -82,7 +95,28 @@ export class MigrationController {
   @ApiResponse({ status: 400, description: 'Run already rolled back' })
   @ApiResponse({ status: 403, description: 'Caller is authenticated but not an admin address' })
   @ApiResponse({ status: 409, description: 'Run still in progress' })
-  rollback(@Param('runId') runId: string) {
-    return this.runner.rollback(runId);
+  rollback(@Param('runId') runId: string, @Req() req?: AuthenticatedRequest) {
+    return this.runner.rollback(runId, req?.user?.address);
+  }
+
+  @Post(':name/mark-applied')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Mark a migration as applied out-of-band',
+    description:
+      'Records an out-of-band schema change in the migration registry with a mandatory audit note, ' +
+      'preventing the runner from attempting a redundant double-apply.',
+  })
+  @ApiParam({ name: 'name', example: 'gigs-add-priority-column' })
+  @ApiResponse({ status: 200, type: MigrationRunResponseDto })
+  @ApiResponse({ status: 400, description: 'Missing or invalid justification note' })
+  @ApiResponse({ status: 403, description: 'Caller is authenticated but not an admin address' })
+  @ApiResponse({ status: 404, description: 'Migration not registered' })
+  @ApiResponse({ status: 409, description: 'Migration already has an active run' })
+  markApplied(
+    @Param('name') name: string,
+    @Body() dto: MarkMigrationAppliedDto,
+  ) {
+    return this.runner.markApplied(name, dto);
   }
 }
